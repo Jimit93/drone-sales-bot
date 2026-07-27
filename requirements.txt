@@ -3,3 +3,4 @@ pydantic
 weasyprint
 langgraph
 langchain-google-genai
+matplotlib
