@@ -2,6 +2,8 @@ import nest_asyncio
 nest_asyncio.apply()
 
 import os
+import re
+import time
 import asyncio
 import imaplib
 import email
@@ -10,6 +12,7 @@ import smtplib
 import uuid
 import logging
 import csv
+import difflib
 from datetime import datetime, timedelta
 from typing import TypedDict, List, Optional, Dict, Any, Literal
 from email.mime.multipart import MIMEMultipart
@@ -24,17 +27,30 @@ from langchain_core.prompts import PromptTemplate
 from langchain_chroma import Chroma
 
 # ==========================================
-# 1. CONFIGURATION
+# 1. CONFIGURATION & ENVIRONMENT
 # ==========================================
-# Securely loading environment variables instead of hardcoding to pass GitHub Push Protection
-os.environ["GOOGLE_API_KEY"] = os.environ.get("GEMINI_API_KEY") 
-EMAIL_USER = os.environ.get("EMAIL_ACCOUNT", "jimit93@gmail.com")  
-EMAIL_PASS = os.environ.get("EMAIL_PASSWORD")     
-IMAP_SERVER = "imap.gmail.com"       
-SMTP_SERVER = "smtp.gmail.com"       
+os.environ["GOOGLE_API_KEY"] = os.environ.get("GEMINI_API_KEY", "")
+EMAIL_USER = os.environ.get("EMAIL_ACCOUNT", "jimit93@gmail.com")
+EMAIL_PASS = os.environ.get("EMAIL_PASSWORD", "")
+IMAP_SERVER = "imap.gmail.com"
+SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Official Inventory Catalog
+CATALOG = {
+    "DJI Neo 2": {"price": 22999.00, "specs": "Weight: ~135g | 1-Axis 4K30 | 15 min flight"},
+    "DJI Mini 5 Pro": {"price": 68999.00, "specs": "Weight: <249g | 50MP 4K/60fps | 38 min flight"},
+    "HoverAir X1 Pro Max": {"price": 45500.00, "specs": "Weight: 193g | 8K Video | 16 min flight"},
+    "DJI Air 3S": {"price": 115000.00, "specs": "Weight: 724g | Dual 50MP/48MP | 45 min flight"},
+    "DJI Mavic 4 Pro": {"price": 175000.00, "specs": "Weight: 1063g | Triple Hasselblad | 51 min flight"},
+    "DJI Avata 3": {"price": 79999.00, "specs": "Weight: ~375g | 4K RockSteady | 140 km/h FPV"},
+    "AAF TurboFly X FPV": {"price": 74800.00, "specs": "Weight: 550g | 1080p Analog/Digital | 10 min flight"},
+    "Maverick 400 RTK": {"price": 479999.00, "specs": "Weight: 1.8 kg | RTK & LiDAR | 42 min flight"},
+    "DJI Matrice 4T (Thermal)": {"price": 660000.00, "specs": "Weight: 920g | Thermal & Laser | 45 min flight"},
+    "EFT Z50P (50-Litre Heavy Lifter)": {"price": 874999.00, "specs": "Payload: 50L | Autonomous Crop Spraying"}
+}
 
 # ==========================================
 # 2. DATABASE MANAGEMENT
@@ -49,14 +65,15 @@ def initialize_database():
             writer.writerow(HEADERS)
         logging.info(f"Initialized database at '{DB_FILE}'")
 
-def get_client_status(email: str) -> dict:
+def get_client_status(email_addr: str) -> Optional[dict]:
     if not os.path.exists(DB_FILE): return None
     with open(DB_FILE, mode='r', newline='', encoding='utf-8') as file:
         for row in csv.DictReader(file):
-            if row["Email"].strip().lower() == email.strip().lower(): return row
+            if row["Email"].strip().lower() == email_addr.strip().lower(): 
+                return row
     return None
 
-def update_client_status(email: str, client_name: str, items: str, new_status: str):
+def update_client_status(email_addr: str, client_name: str, items: str, new_status: str):
     rows = []
     updated = False
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -64,9 +81,8 @@ def update_client_status(email: str, client_name: str, items: str, new_status: s
     if os.path.exists(DB_FILE):
         with open(DB_FILE, mode='r', newline='', encoding='utf-8') as file:
             for row in csv.DictReader(file):
-                if row["Email"].strip().lower() == email.strip().lower():
+                if row["Email"].strip().lower() == email_addr.strip().lower():
                     row["Status"] = new_status
-                    # Protect existing items if client just replies "yes" or "approved"
                     if items: row["Requested Items"] = items
                     row["Last Updated"] = current_time
                     if new_status == "QUOTE_SENT": row["Quotation Sent"] = f"Yes - {current_time}"
@@ -77,7 +93,7 @@ def update_client_status(email: str, client_name: str, items: str, new_status: s
                 
     if not updated:
         rows.append({
-            "Email": email.lower(),
+            "Email": email_addr.lower(),
             "Client Name": client_name,
             "Requested Items": items,
             "Status": new_status,
@@ -91,12 +107,12 @@ def update_client_status(email: str, client_name: str, items: str, new_status: s
         writer = csv.DictWriter(file, fieldnames=HEADERS)
         writer.writeheader()
         writer.writerows(rows)
-    logging.info(f"DATABASE UPDATE: {email} status changed to {new_status}")
+    logging.info(f"DATABASE UPDATE: {email_addr} status changed to {new_status}")
 
 initialize_database()
 
 # ==========================================
-# 3. STATE & SCHEMAS (WITH SEMANTIC UPGRADES)
+# 3. AGENT STATE & STRUCTURED SCHEMAS
 # ==========================================
 class AgentState(TypedDict):
     email_id: str
@@ -105,77 +121,116 @@ class AgentState(TypedDict):
     email_subject: str
     email_body: str
     current_db_status: Optional[str]
-    intent: Literal["new_inquiry", "quote_approval", "delivery_confirmed", "invoice_response", "unrelated"]
+    intent: Literal["new_inquiry", "quote_approval", "delivery_confirmed", "invoice_response", "clarification_needed", "out_of_stock", "unrelated"]
     company_name: Optional[str]
     requested_items: List[Dict[str, Any]]
+    unrecognized_item_name: Optional[str]
     generated_doc_path: Optional[str]
     doc_type_sent: Optional[str]
     reply_message: Optional[str]
     error_message: Optional[str]
 
 class RequestedItem(BaseModel):
-    product: str = Field(description="Product name matching inventory")
-    quantity: int = Field(description="Quantity")
+    product: str = Field(description="Product name or query mentioned by client")
+    quantity: int = Field(default=1, description="Quantity requested")
 
 class EmailExtraction(BaseModel):
-    intent: Literal["new_inquiry", "quote_approval", "delivery_confirmed", "invoice_response", "unrelated"] = Field(
-        description="""Classify the email intent strictly based on semantic meaning:
-        - 'new_inquiry': Client asks for a quotation, price, specifications, or details (e.g., 'send quote', 'what is the price', 'send specs').
-        - 'quote_approval': Client approves the quote (e.g., 'Ok I want this', 'Approved', 'Agreed').
-        - 'delivery_confirmed': Client confirms they received the order (e.g., 'Order received', 'Got it', 'Delivered', 'Yes I did' when asked about the order).
-        - 'invoice_response': Client answers 'yes' or 'no' when asked if they received the invoice.
-        - 'unrelated': Spam or unrelated chatter."""
+    is_drone_inquiry: bool = Field(description="True ONLY if email is a genuine business inquiry regarding purchasing, quoting, or tracking our drones.")
+    intent: Literal["new_inquiry", "quote_approval", "delivery_confirmed", "invoice_response", "clarification_needed", "out_of_stock", "unrelated"] = Field(
+        description="""Classify the email intent:
+        - 'new_inquiry': Client asks for a quote, price, specs, or purchase of available drones.
+        - 'quote_approval': Client approves quote / requests LPO.
+        - 'delivery_confirmed': Client confirms delivery receipt.
+        - 'invoice_response': Client answers about receiving tax invoice.
+        - 'clarification_needed': Product request is ambiguous (e.g. asking for 'Mavic Pro' when multiple versions exist).
+        - 'out_of_stock': Client explicitly asks for a drone model not present in our stock/catalog.
+        - 'unrelated': General spam, marketing, newsletter, or non-drone inquiry."""
     )
-    items: List[RequestedItem] = Field(description="List of requested items. Leave empty if they are just replying yes/no/approved.")
+    items: List[RequestedItem] = Field(default=[], description="List of items mentioned")
+    unrecognized_item: Optional[str] = Field(default=None, description="Name of the item if client asked for something completely outside our drone catalog")
+    clarification_prompt: Optional[str] = Field(default=None, description="Question to send to client if clarification is needed (e.g. 'Did you mean DJI Mavic 4 Pro?')")
 
 # ==========================================
-# 4. LANGGRAPH NODES
+# 4. LANGGRAPH WORKFLOW NODES
 # ==========================================
-def extract_requirements(state: AgentState) -> dict:
-    logging.info(f"Analyzing intent for {state['display_name']}...")
+def extract_and_validate_intent(state: AgentState) -> dict:
+    logging.info(f"Analyzing intent for {state['display_name']} ({state['sender_email']})...")
     db_record = get_client_status(state['sender_email'])
     current_status = db_record["Status"] if db_record else "NEW_CLIENT"
     
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-2")
-    vectorstore = Chroma(persist_directory="./chroma_db", embedding_function=embeddings)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+    catalog_summary = "\n".join([f"- {name}: ₹{data['price']}" for name, data in CATALOG.items()])
     
-    relevant_docs = retriever.invoke(state["email_body"])
-    inventory_context = "\n\n".join([doc.page_content for doc in relevant_docs])
-    
-    llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash", temperature=0)
+    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
     structured_llm = llm.with_structured_output(EmailExtraction)
     
     prompt = PromptTemplate.from_template(
-        "You are an AI sales agent. Analyze the client's email based on their status: {current_status}\n\n"
-        "Inventory:\n{inventory_context}\n\n"
-        "Sender: {sender}\nSubject: {subject}\nBody: {body}\n\n"
-        "Determine intent and extract requested items (if mentioned)."
+        "You are an AI sales engineer for Aerotech Drones.\n"
+        "Analyze the client's email based on their sales pipeline status: {current_status}\n\n"
+        "Our Available Drone Catalog:\n{catalog_summary}\n\n"
+        "Sender: {sender}\nSubject: {subject}\nBody:\n{body}\n\n"
+        "Guidelines:\n"
+        "1. If email is spam, personal chatter, or unrelated to our drone business, set is_drone_inquiry=False and intent='unrelated'.\n"
+        "2. If client asks for a model that is ambiguous (e.g., 'mavic pro' or 'dji drone'), set intent='clarification_needed' and write a polite clarification_prompt asking if they meant a specific model from our catalog.\n"
+        "3. If client asks for a drone model totally outside our catalog (e.g. 'Skydio', 'Autel'), set intent='out_of_stock' and populate unrecognized_item.\n"
+        "4. Otherwise, classify intent appropriately and extract requested items."
     )
     
     result = (prompt | structured_llm).invoke({
         "current_status": current_status,
-        "inventory_context": inventory_context,
+        "catalog_summary": catalog_summary,
         "sender": state["display_name"],
         "subject": state["email_subject"],
         "body": state["email_body"]
     })
     
-    requested_items = [{"product": item.product, "quantity": item.quantity} for item in result.items]
+    if not result.is_drone_inquiry or result.intent == "unrelated":
+        return {"intent": "unrelated", "reply_message": None}
+
+    if result.intent == "clarification_needed":
+        reply = result.clarification_prompt or "Sir, could you please specify which drone model you require from our catalog?"
+        return {"intent": "clarification_needed", "reply_message": reply}
+
+    if result.intent == "out_of_stock":
+        item_name = result.unrecognized_item or "the requested drone model"
+        reply = f"Dear {state['display_name']},\n\nSorry sir, {item_name} is not available in our stock right now.\n\nPlease let us know if you would like specifications for any of our available models."
+        return {"intent": "out_of_stock", "reply_message": reply, "unrecognized_item_name": item_name}
+
+    # Process items using fuzzy string matching
+    extracted_items = []
+    catalog_keys = list(CATALOG.keys())
     
-    # If LLM didn't extract items but we have them in the DB, recover them (so we can build the PDF)
-    if not requested_items and db_record and db_record.get("Requested Items"):
+    for item in result.items:
+        raw_name = item.product.strip()
+        matched_name = None
+        
+        # Exact/Substring check
+        for cat_key in catalog_keys:
+            if raw_name.lower() in cat_key.lower() or cat_key.lower() in raw_name.lower():
+                matched_name = cat_key
+                break
+                
+        # Fuzzy match fallback
+        if not matched_name:
+            closest = difflib.get_close_matches(raw_name, catalog_keys, n=1, cutoff=0.4)
+            if closest:
+                matched_name = closest[0]
+                
+        if matched_name:
+            extracted_items.append({"product": matched_name, "quantity": item.quantity})
+
+    # Recover items from DB if user is approving quote without re-typing item name
+    if not extracted_items and db_record and db_record.get("Requested Items"):
         items_str = db_record["Requested Items"]
         for block in items_str.split(", "):
             if "x " in block:
                 qty, prod = block.split("x ", 1)
-                requested_items.append({"product": prod, "quantity": int(qty)})
-                
+                extracted_items.append({"product": prod, "quantity": int(qty)})
+
     return {
         "current_db_status": current_status,
         "intent": result.intent,
         "company_name": state["display_name"],
-        "requested_items": requested_items
+        "requested_items": extracted_items
     }
 
 def route_workflow(state: AgentState) -> str:
@@ -184,36 +239,23 @@ def route_workflow(state: AgentState) -> str:
     elif i == "quote_approval": return "generate_lpo"
     elif i == "delivery_confirmed": return "ask_about_invoice"
     elif i == "invoice_response": return "generate_invoice"
+    elif i in ["clarification_needed", "out_of_stock"]: return "dispatch_direct_message"
     else: return "end"
 
 def generate_professional_pdf(doc_type: str, state: AgentState) -> str:
-    """Generates perfectly aligned, template-specific PDFs with automated 18% GST."""
     client_name = state.get("company_name", "Valued Client")
     requested_items = state.get("requested_items", [])
     current_date = datetime.now()
     date_str = current_date.strftime("%d %b %Y")
     valid_until = (current_date + timedelta(days=30)).strftime("%d %b %Y")
     run_id = str(uuid.uuid4().hex[:6]).upper()
-    
-    CATALOG = {
-        "DJI Neo 2": {"price": 22999.00, "specs": "Weight: ~135g | 1-Axis 4K30 | 15 min flight"},
-        "DJI Mini 5 Pro": {"price": 68999.00, "specs": "Weight: <249g | 50MP 4K/60fps | 38 min flight"},
-        "HoverAir X1 Pro Max": {"price": 45500.00, "specs": "Weight: 193g | 8K Video | 16 min flight"},
-        "DJI Air 3S": {"price": 115000.00, "specs": "Weight: 724g | Dual 50MP/48MP | 45 min flight"},
-        "DJI Mavic 4 Pro": {"price": 175000.00, "specs": "Weight: 1063g | Triple Hasselblad | 51 min flight"},
-        "DJI Avata 3": {"price": 79999.00, "specs": "Weight: ~375g | 4K RockSteady | 140 km/h FPV"},
-        "AAF TurboFly X FPV": {"price": 74800.00, "specs": "Weight: 550g | 1080p Analog/Digital | 10 min flight"},
-        "Maverick 400 RTK": {"price": 479999.00, "specs": "Weight: 1.8 kg | RTK & LiDAR | 42 min flight"},
-        "DJI Matrice 4T (Thermal)": {"price": 660000.00, "specs": "Weight: 920g | Thermal & Laser | 45 min flight"},
-        "EFT Z50P (50-Litre Heavy Lifter)": {"price": 874999.00, "specs": "Payload: 50L | Autonomous Crop Spraying"}
-    }
 
     subtotal = 0.0
     table_rows = ""
     for idx, item in enumerate(requested_items, start=1):
-        prod = item.get("product", "Unknown Item")
+        prod = item.get("product", "Standard Drone Model")
         qty = item.get("quantity", 1)
-        item_data = CATALOG.get(prod, {"price": 0.00, "specs": "Standard specifications apply."})
+        item_data = CATALOG.get(prod, {"price": 0.00, "specs": "Standard commercial specifications apply."})
         price = item_data["price"]
         specs = item_data["specs"]
         
@@ -265,9 +307,7 @@ def generate_professional_pdf(doc_type: str, state: AgentState) -> str:
                 </tr></table>
             </div>
             <div class="info-grid">
-                <div class="info-col">
-                    <strong>Customer Name:</strong><br>{client_name}
-                </div>
+                <div class="info-col"><strong>Customer Name:</strong><br>{client_name}</div>
                 <div class="info-col" style="text-align: right;">
                     <strong>Quotation No:</strong> QT-{current_date.strftime("%y%m")}-{run_id}<br>
                     <strong>Quote Date:</strong> {date_str}<br>
@@ -399,21 +439,42 @@ def generate_professional_pdf(doc_type: str, state: AgentState) -> str:
     return path
 
 def generate_quote(state: AgentState) -> dict:
-    logging.info("Phase 1: Generating Quotation...")
+    logging.info("Generating Quotation PDF...")
     return {"generated_doc_path": generate_professional_pdf("Quotation", state), "doc_type_sent": "Quotation"}
 
 def generate_lpo(state: AgentState) -> dict:
-    logging.info("Phase 2: Generating Local Purchase Order...")
+    logging.info("Generating LPO PDF...")
     return {"generated_doc_path": generate_professional_pdf("LPO", state), "doc_type_sent": "Local Purchase Order"}
 
-# NEW CONVERSATIONAL NODE
 def ask_about_invoice(state: AgentState) -> dict:
-    logging.info("Phase 3: Asking if they received the invoice...")
     return {"doc_type_sent": "Invoice Inquiry", "reply_message": "Sir, have you received the invoice?", "generated_doc_path": None}
 
 def generate_invoice(state: AgentState) -> dict:
-    logging.info("Phase 4: Generating Tax Invoice...")
+    logging.info("Generating Tax Invoice PDF...")
     return {"generated_doc_path": generate_professional_pdf("Invoice", state), "doc_type_sent": "Tax Invoice", "reply_message": "Here is your invoice sir."}
+
+def dispatch_direct_message(state: AgentState) -> dict:
+    """Handles sending text replies for clarification or out-of-stock messages directly."""
+    msg = MIMEMultipart()
+    msg['From'] = EMAIL_USER
+    msg['To'] = state["sender_email"]
+    msg['Subject'] = f"Re: {state['email_subject']}"
+    
+    body = state.get("reply_message", "Thank you for reaching out to Aerotech Drones.")
+    msg.attach(MIMEText(body, 'plain'))
+    
+    try:
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(EMAIL_USER, EMAIL_PASS)
+        server.send_message(msg)
+        server.quit()
+        logging.info(f"Direct response dispatched to {state['sender_email']}")
+    except Exception as e:
+        logging.error(f"Failed to dispatch direct response: {e}")
+        return {"error_message": str(e)}
+
+    return {"error_message": None}
 
 def dispatch_and_update(state: AgentState) -> dict:
     doc_type = state["doc_type_sent"]
@@ -447,6 +508,7 @@ def dispatch_and_update(state: AgentState) -> dict:
         server.login(EMAIL_USER, EMAIL_PASS)
         server.send_message(msg)
         server.quit()
+        logging.info(f"Attachment email dispatched to {state['sender_email']}")
     except Exception as e:
         return {"error_message": str(e)}
 
@@ -454,28 +516,37 @@ def dispatch_and_update(state: AgentState) -> dict:
     update_client_status(state["sender_email"], state["display_name"], items_str, new_status)
     return {"error_message": None}
 
+# Graph Construction
 workflow = StateGraph(AgentState)
-workflow.add_node("extract", extract_requirements)
+workflow.add_node("extract", extract_and_validate_intent)
 workflow.add_node("generate_quote", generate_quote)
 workflow.add_node("generate_lpo", generate_lpo)
 workflow.add_node("ask_about_invoice", ask_about_invoice)
 workflow.add_node("generate_invoice", generate_invoice)
+workflow.add_node("dispatch_direct_message", dispatch_direct_message)
 workflow.add_node("dispatch", dispatch_and_update)
 
 workflow.set_entry_point("extract")
 workflow.add_conditional_edges("extract", route_workflow, {
-    "generate_quote": "generate_quote", "generate_lpo": "generate_lpo", 
-    "ask_about_invoice": "ask_about_invoice", "generate_invoice": "generate_invoice", "end": END
+    "generate_quote": "generate_quote",
+    "generate_lpo": "generate_lpo", 
+    "ask_about_invoice": "ask_about_invoice",
+    "generate_invoice": "generate_invoice",
+    "dispatch_direct_message": "dispatch_direct_message",
+    "end": END
 })
+
 workflow.add_edge("generate_quote", "dispatch")
 workflow.add_edge("generate_lpo", "dispatch")
 workflow.add_edge("ask_about_invoice", "dispatch")
 workflow.add_edge("generate_invoice", "dispatch")
+workflow.add_edge("dispatch_direct_message", END)
 workflow.add_edge("dispatch", END)
+
 app = workflow.compile()
 
 # ==========================================
-# 5. ASYNC WORKERS & PROACTIVE CHASER
+# 5. ASYNC POLLER & PROACTIVE FOLLOW-UP
 # ==========================================
 LAST_CHECKED_ID = None
 
@@ -492,7 +563,7 @@ def fetch_unread_emails():
             uids = messages[0].split()
             if LAST_CHECKED_ID is None:
                 LAST_CHECKED_ID = int(uids[-1])
-                logging.info(f"Baseline set to UID {LAST_CHECKED_ID}. Send a NEW email now...")
+                logging.info(f"Baseline initialized at UID {LAST_CHECKED_ID}. Awaiting new emails...")
                 mail.logout()
                 return []
             
@@ -518,24 +589,24 @@ def fetch_unread_emails():
 
                         emails_data.append({
                             "email_id": uid.decode(), "sender_email": sender_email,
-                            "display_name": display_name, "email_subject": msg['subject'], "email_body": body
+                            "display_name": display_name, "email_subject": msg.get('subject', 'Drone Inquiry'), "email_body": body
                         })
         else:
             if LAST_CHECKED_ID is None:
                 stat_all, msg_all = mail.uid('search', None, 'ALL')
                 if stat_all == 'OK' and msg_all[0]: LAST_CHECKED_ID = int(msg_all[0].split()[-1])
                 else: LAST_CHECKED_ID = 0
-                logging.info("Baseline set with 0 unread emails. Send a NEW email now...")
+                logging.info("Baseline set with 0 unread emails.")
         mail.logout()
     except Exception as e:
-        pass
+        logging.error(f"Polling exception: {e}")
     return emails_data
 
 async def email_poller(queue: asyncio.Queue):
     while True:
         new_emails = await asyncio.to_thread(fetch_unread_emails)
         for mail in new_emails:
-            logging.info(f"Picked up {mail['email_subject']} from {mail['sender_email']}")
+            logging.info(f"Inbound email detected: '{mail['email_subject']}' from {mail['sender_email']}")
             await queue.put(mail)
         await asyncio.sleep(10)
 
@@ -544,24 +615,33 @@ async def agent_worker(queue: asyncio.Queue):
         try:
             mail_data = await queue.get()
             initial_state = {
-                "email_id": mail_data.get("email_id", ""), "sender_email": mail_data.get("sender_email", ""),
-                "display_name": mail_data.get("display_name", ""), "email_subject": mail_data.get("email_subject", ""),
-                "email_body": mail_data.get("email_body", ""), "current_db_status": None, "intent": "unrelated",
-                "company_name": mail_data.get("display_name", ""), "requested_items": [], "generated_doc_path": None,
-                "doc_type_sent": None, "reply_message": None, "error_message": None
+                "email_id": mail_data.get("email_id", ""), 
+                "sender_email": mail_data.get("sender_email", ""),
+                "display_name": mail_data.get("display_name", ""), 
+                "email_subject": mail_data.get("email_subject", ""),
+                "email_body": mail_data.get("email_body", ""), 
+                "current_db_status": None, 
+                "intent": "unrelated",
+                "company_name": mail_data.get("display_name", ""), 
+                "requested_items": [], 
+                "unrecognized_item_name": None,
+                "generated_doc_path": None,
+                "doc_type_sent": None, 
+                "reply_message": None, 
+                "error_message": None
             }
             await asyncio.to_thread(app.invoke, initial_state)
             queue.task_done()
-            await asyncio.sleep(30)
+            await asyncio.sleep(10)
         except Exception as e:
+            logging.error(f"Worker process error: {e}")
             queue.task_done()
             await asyncio.sleep(10)
 
-# NEW: The Proactive AI Loop
 async def lpo_chaser():
-    logging.info("Starting Proactive LPO Chaser...")
+    logging.info("Proactive LPO Chaser service running...")
     while True:
-        await asyncio.sleep(60) # Scans DB every 60 seconds
+        await asyncio.sleep(60)
         if not os.path.exists(DB_FILE): continue
         
         current_time = datetime.now()
@@ -571,15 +651,13 @@ async def lpo_chaser():
                 last_updated_str = row["Last Updated"]
                 try:
                     last_updated = datetime.strptime(last_updated_str, "%Y-%m-%d %H:%M:%S")
-                    # TRIGGER: If LPO was sent more than 2 minutes ago (Change 120 to 86400 for 24 hours)
                     if status == "LPO_SENT" and (current_time - last_updated).total_seconds() > 120:
-                        logging.info(f"Client {row['Email']} went silent. Sending proactive follow-up...")
+                        logging.info(f"Proactive follow-up trigger for {row['Email']}")
                         
-                        # Dispatch Follow-up Email
                         msg = MIMEMultipart()
                         msg['From'] = EMAIL_USER
                         msg['To'] = row['Email']
-                        msg['Subject'] = "Regarding to your lpo"
+                        msg['Subject'] = "Regarding your LPO order status"
                         msg.attach(MIMEText("Sir, have you received your order?", 'plain'))
                         
                         server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
@@ -588,16 +666,13 @@ async def lpo_chaser():
                         server.send_message(msg)
                         server.quit()
                         
-                        # Update DB so we don't spam them every minute
                         update_client_status(row['Email'], row['Client Name'], row['Requested Items'], "ASKED_DELIVERY_STATUS")
                 except Exception as e:
                     pass
 
 async def main():
     email_queue = asyncio.Queue()
-    # Run all three AI systems simultaneously
     await asyncio.gather(email_poller(email_queue), agent_worker(email_queue), lpo_chaser())
 
 if __name__ == "__main__":
-    # Changed from 'await main()' which crashes in standard Python scripts
     asyncio.run(main())
