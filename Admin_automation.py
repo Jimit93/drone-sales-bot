@@ -18,12 +18,18 @@ from typing import TypedDict, List, Optional, Dict, Any, Literal
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
+from email.mime.image import MIMEImage
 
 from pydantic import BaseModel, Field
 from weasyprint import HTML
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
+
+# Matplotlib backend fix for headless servers
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 # ==========================================
 # 1. CONFIGURATION & ENVIRONMENT
@@ -38,7 +44,6 @@ DB_FILE = "aerotech.db"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Initial seed data combining your CSV and specs
 INITIAL_INVENTORY = [
     ("DJI Neo 2", 16000.0, 22999.0, 49, 1, "Weight: ~135g | 1-Axis 4K30 | 15 min flight"),
     ("DJI Mini 5 Pro", 52000.0, 68999.0, 40, 0, "Weight: <249g | 50MP 4K/60fps | 38 min flight"),
@@ -58,8 +63,6 @@ INITIAL_INVENTORY = [
 def initialize_database():
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
-        
-        # Orders Table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS orders (
                 email TEXT PRIMARY KEY,
@@ -69,8 +72,6 @@ def initialize_database():
                 last_updated TEXT
             )
         """)
-        
-        # Inventory Table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS inventory (
                 product_name TEXT PRIMARY KEY,
@@ -81,8 +82,6 @@ def initialize_database():
                 specs TEXT
             )
         """)
-        
-        # Check if inventory is empty, if so, seed from CSV data
         cursor.execute("SELECT COUNT(*) FROM inventory")
         if cursor.fetchone()[0] == 0:
             cursor.executemany(
@@ -121,7 +120,6 @@ def update_client_status(email_addr: str, client_name: str, items: str, new_stat
             last_updated=excluded.last_updated
         """, (email_addr.lower(), client_name, items, new_status, current_time))
         conn.commit()
-    logging.info(f"ERP UPDATE: {email_addr} status changed to {new_status}")
 
 initialize_database()
 
@@ -151,15 +149,7 @@ class RequestedItem(BaseModel):
 class EmailExtraction(BaseModel):
     is_drone_inquiry: bool = Field(description="True ONLY if email is a genuine business inquiry OR an owner analytics request.")
     intent: Literal["new_inquiry", "quote_approval", "delivery_confirmed", "invoice_response", "clarification_needed", "out_of_stock", "owner_analytics", "unrelated"] = Field(
-        description="""Classify the email intent:
-        - 'new_inquiry': Client asks for a quote.
-        - 'quote_approval': Client approves quote / requests LPO.
-        - 'delivery_confirmed': Client confirms delivery.
-        - 'invoice_response': Client answers about invoice.
-        - 'clarification_needed': Product request is ambiguous.
-        - 'out_of_stock': Client asks for a drone not in our catalog.
-        - 'owner_analytics': The system owner is asking for a report on sales, stock, or business performance.
-        - 'unrelated': Spam or chatter."""
+        description="Classify intent: new_inquiry, quote_approval, delivery_confirmed, invoice_response, clarification_needed, out_of_stock, owner_analytics, unrelated"
     )
     items: List[RequestedItem] = Field(default=[], description="List of items mentioned")
     unrecognized_item: Optional[str] = Field(default=None)
@@ -182,7 +172,7 @@ def extract_and_validate_intent(state: AgentState) -> dict:
     prompt = PromptTemplate.from_template(
         "You are an AI sales engineer for Aerotech Drones.\n"
         "Sender: {sender_email}\nSubject: {subject}\nBody:\n{body}\n\n"
-        "CRITICAL RULE: If the sender is 'jimit93@gmail.com' and they are asking how much sold today, what is left in stock, or requesting an analytics report, you MUST set intent to 'owner_analytics' and is_drone_inquiry to True.\n\n"
+        "CRITICAL RULE: If the sender is 'jimit93@gmail.com' and they are asking about stock (e.g. 'how much mavic 4 pro and neo 2 in stock'), sales, or analytics, you MUST set intent to 'owner_analytics' and is_drone_inquiry to True.\n\n"
         "Available Catalog:\n{catalog_summary}\n\n"
         "Classify the intent strictly."
     )
@@ -194,7 +184,8 @@ def extract_and_validate_intent(state: AgentState) -> dict:
         "catalog_summary": catalog_summary
     })
     
-    if state["sender_email"].lower() == "jimit93@gmail.com" and ("sold" in state["email_body"].lower() or "report" in state["email_body"].lower() or "stock" in state["email_body"].lower()):
+    body_lower = state["email_body"].lower()
+    if state["sender_email"].lower() == "jimit93@gmail.com" and ("stock" in body_lower or "sold" in body_lower or "report" in body_lower or "how much" in body_lower):
         return {"intent": "owner_analytics"}
         
     if not result.is_drone_inquiry or result.intent == "unrelated":
@@ -209,7 +200,6 @@ def extract_and_validate_intent(state: AgentState) -> dict:
 
     extracted_items = []
     catalog_keys = list(catalog.keys())
-    
     for item in result.items:
         raw_name = item.product.strip()
         matched_name = None
@@ -220,7 +210,6 @@ def extract_and_validate_intent(state: AgentState) -> dict:
         if not matched_name:
             closest = difflib.get_close_matches(raw_name, catalog_keys, n=1, cutoff=0.4)
             if closest: matched_name = closest[0]
-                
         if matched_name:
             extracted_items.append({"product": matched_name, "quantity": item.quantity})
 
@@ -242,107 +231,56 @@ def route_workflow(state: AgentState) -> str:
     elif i in ["clarification_needed", "out_of_stock"]: return "dispatch_direct_message"
     else: return "end"
 
-# ----------------- BI ANALYTICS NODE -----------------
+# ----------------- CLEAN MATPLOTLIB BI ANALYTICS -----------------
 def generate_analytics(state: AgentState) -> dict:
-    logging.info("Executing Executive BI Analyst Node...")
+    logging.info("Generating Clean Matplotlib BI Analytics...")
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT product_name, stock, sales, selling_price, buying_price FROM inventory")
         inv_data = cursor.fetchall()
-        
-        today = datetime.now().strftime("%Y-%m-%d")
-        cursor.execute("SELECT * FROM orders WHERE status = 'INVOICE_SENT' AND last_updated LIKE ?", (today + '%',))
-        today_invoices = cursor.fetchall()
 
-    total_revenue, total_profit = 0, 0
-    labels, sales_data, stock_data = [], [], []
-    inventory_summary_text = ""
-    
-    for row in inv_data:
-        name, stock, sales, sp, bp = row
-        rev = sales * sp
-        prof = sales * (sp - bp)
-        total_revenue += rev
-        total_profit += prof
-        labels.append(f'"{name}"')
-        sales_data.append(str(sales))
-        stock_data.append(str(stock))
-        inventory_summary_text += f"{name}: {stock} in stock, {sales} total sold.\n"
+    products = [row[0] for row in inv_data]
+    stocks = [row[1] for row in inv_data]
+    sales = [row[2] for row in inv_data]
 
-    # AI Business Logic
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.7)
-    prompt = f"""You are the Executive BI Analyst for Aerotech Drones. The owner asked for a report.
-    Total All-Time Revenue: ₹{total_revenue:,.2f}
-    Total All-Time Profit: ₹{total_profit:,.2f}
-    Deals Closed Today: {len(today_invoices)}
-    
-    Inventory State:
-    {inventory_summary_text}
-    
-    Provide 3 short, punchy, highly actionable business suggestions based on this exact data to increase efficiency or sales."""
-    ai_suggestions = llm.invoke(prompt).content
+    # Check if specific items were requested (e.g. Mavic 4 Pro and Neo 2)
+    body_text = state["email_body"].lower()
+    targeted_text = ""
+    for name, stock, sale, sp, bp in inv_data:
+        if name.lower().replace("dji ", "") in body_text or name.lower() in body_text:
+            targeted_text += f"{name} is {stock} now in stock.\n"
 
-    html_content = f"""
-    <html>
-    <head>
-        <title>Aerotech BI Dashboard</title>
-        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-        <style>
-            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f7f6; padding: 40px; color: #333; }}
-            .card {{ background: white; padding: 25px; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); margin-bottom: 20px; }}
-            h1 {{ color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }}
-            .metrics-grid {{ display: flex; gap: 20px; margin-bottom: 20px; }}
-            .metric-box {{ flex: 1; background: #3498db; color: white; padding: 20px; border-radius: 8px; text-align: center; }}
-            .metric-box h2 {{ margin: 0; font-size: 28px; }}
-            .metric-box p {{ margin: 5px 0 0 0; text-transform: uppercase; font-size: 12px; font-weight: bold; }}
-            .profit-box {{ background: #2ecc71; }}
-        </style>
-    </head>
-    <body>
-        <div class="card">
-            <h1>Aerotech Executive Dashboard</h1>
-            <div class="metrics-grid">
-                <div class="metric-box"><h2>₹{total_revenue:,.2f}</h2><p>Gross Revenue</p></div>
-                <div class="metric-box profit-box"><h2>₹{total_profit:,.2f}</h2><p>Net Profit</p></div>
-                <div class="metric-box" style="background:#e74c3c;"><h2>{len(today_invoices)}</h2><p>Invoices Closed Today</p></div>
-            </div>
-            
-            <h3>AI Business Analyst Insights</h3>
-            <div style="background: #fdfbf7; border-left: 4px solid #f39c12; padding: 15px; margin-bottom: 30px;">
-                {ai_suggestions.replace(chr(10), '<br>')}
-            </div>
+    if not targeted_text:
+        # Default report if general stock was asked
+        targeted_text = "Current Stock Overview:\n"
+        for name, stock, sale, sp, bp in inv_data:
+            targeted_text += f"{name} is {stock} now in stock.\n"
 
-            <div style="width: 100%; max-width: 900px; margin: auto;">
-                <canvas id="inventoryChart"></canvas>
-            </div>
-        </div>
+    # Build clean matplotlib figure
+    plt.figure(figsize=(10, 6))
+    x = range(len(products))
+    width = 0.35
 
-        <script>
-        const ctx = document.getElementById('inventoryChart');
-        new Chart(ctx, {{
-            type: 'bar',
-            data: {{
-                labels: [{",".join(labels)}],
-                datasets: [
-                    {{ label: 'Total Units Sold', data: [{",".join(sales_data)}], backgroundColor: 'rgba(46, 204, 113, 0.8)' }},
-                    {{ label: 'Current Stock', data: [{",".join(stock_data)}], backgroundColor: 'rgba(52, 152, 219, 0.8)' }}
-                ]
-            }},
-            options: {{ responsive: true, scales: {{ y: {{ beginAtZero: true }} }} }}
-        }});
-        </script>
-    </body>
-    </html>
-    """
-    
+    plt.bar([p - width/2 for p in x], sales, width=width, label='Total Sold', color='#2ecc71')
+    plt.bar([p + width/2 for p in x], stocks, width=width, label='Current Stock', color='#3498db')
+
+    plt.xlabel('Drone Models', fontsize=12, fontweight='bold')
+    plt.ylabel('Units', fontsize=12, fontweight='bold')
+    plt.title('Aerotech Drones - Live Inventory & Sales Report', fontsize=14, fontweight='bold', pad=15)
+    plt.xticks(x, [p.replace("DJI ", "") for p in products], rotation=45, ha='right')
+    plt.legend()
+    plt.tight_layout()
+
     os.makedirs("./docs", exist_ok=True)
-    path = f"./docs/Aerotech_Dashboard_{datetime.now().strftime('%y%m%d')}.html"
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(html_content)
+    chart_path = f"./docs/inventory_chart_{datetime.now().strftime('%y%m%d_%H%M%S')}.png"
+    plt.savefig(chart_path, dpi=300)
+    plt.close()
 
-    return {"generated_doc_path": path, "doc_type_sent": "Analytics Dashboard", "reply_message": "Sir, your Executive BI Dashboard has been generated based on live database metrics. Please open the attached HTML file in any browser."}
+    reply_text = f"Dear Jimit,\n\nHere is the requested stock status:\n\n{targeted_text}\n\nA clean visual inventory & sales chart has been attached for your review.\n\nBest Regards,\nAerotech AI ERP"
 
-# ----------------- DOCUMENT GENERATORS -----------------
+    return {"generated_doc_path": chart_path, "doc_type_sent": "Analytics Dashboard", "reply_message": reply_text}
+
+# ----------------- STANDARD DOCUMENT GENERATORS -----------------
 def generate_professional_pdf(doc_type: str, state: AgentState) -> str:
     client_name = state.get("company_name", state.get("display_name", "Valued Client"))
     requested_items = state.get("requested_items", [])
@@ -357,15 +295,13 @@ def generate_professional_pdf(doc_type: str, state: AgentState) -> str:
         qty = item.get("quantity", 1)
         price = catalog.get(prod, {"price": 0.0})["price"]
         specs = catalog.get(prod, {"specs": ""})["specs"]
-        
         line_total = qty * price
         subtotal += line_total
-        
         table_rows += f"""<tr><td style="text-align:center;">{idx}</td><td><strong>{prod}</strong><br><span style="font-size:10px;color:#555;">{specs}</span></td><td style="text-align:center;">{qty}</td><td style="text-align:right;">₹{price:,.2f}</td><td style="text-align:right;">₹{line_total:,.2f}</td></tr>"""
 
     gst = subtotal * 0.18
     grand_total = subtotal + gst
-    html = f"""<html><body style="font-family:Helvetica; font-size:12px; padding:20px;">
+    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{{font-family:Helvetica;font-size:12px;padding:20px;}}</style></head><body>
         <h2>AEROTECH DRONES - {doc_type.upper()}</h2>
         <p><strong>To:</strong> {client_name}<br><strong>Date:</strong> {current_date.strftime("%d %b %Y")}<br><strong>Ref:</strong> {run_id}</p>
         <table style="width:100%; border-collapse:collapse; margin-bottom:20px;" border="1" cellpadding="8">
@@ -393,22 +329,17 @@ def ask_about_invoice(state: AgentState) -> dict:
 def generate_invoice(state: AgentState) -> dict:
     logging.info("Generating Tax Invoice & Deducting Inventory...")
     requested_items = state.get("requested_items", [])
-    
-    # --- ERP CORE: INVENTORY DEDUCTION ---
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         for item in requested_items:
             prod = item.get("product")
             qty = item.get("quantity", 1)
-            # Math: Ensure stock doesn't go below 0 visually, but deduct logically and add to sales
             cursor.execute("""
                 UPDATE inventory 
                 SET stock = MAX(stock - ?, 0), sales = sales + ? 
                 WHERE product_name = ?
             """, (qty, qty, prod))
         conn.commit()
-    # ---------------------------------------
-
     return {"generated_doc_path": generate_professional_pdf("Invoice", state), "doc_type_sent": "Tax Invoice", "reply_message": "Here is your final tax invoice sir."}
 
 # ----------------- DISPATCHERS -----------------
@@ -438,23 +369,24 @@ def dispatch_and_update(state: AgentState) -> dict:
         msg.attach(MIMEText(state["reply_message"], 'plain'))
         new_status = "ASKED_INVOICE_STATUS"
     elif doc_type == "Analytics Dashboard":
-        msg['Subject'] = "Aerotech Executive BI Report"
+        msg['Subject'] = "Aerotech Executive Stock & Sales Report"
         msg.attach(MIMEText(state["reply_message"], 'plain'))
         filepath = state.get("generated_doc_path")
-        with open(filepath, "rb") as f:
-            part = MIMEApplication(f.read(), Name=os.path.basename(filepath))
-        part['Content-Disposition'] = f'attachment; filename="{os.path.basename(filepath)}"'
-        msg.attach(part)
+        if filepath and os.path.exists(filepath):
+            with open(filepath, "rb") as f:
+                part = MIMEApplication(f.read(), Name=os.path.basename(filepath))
+            part['Content-Disposition'] = f'attachment; filename="{os.path.basename(filepath)}"'
+            msg.attach(part)
         new_status = "ANALYTICS_SENT"
     else:
         msg['Subject'] = f"Your {doc_type} from Aerotech Drones"
         msg.attach(MIMEText(state.get("reply_message", f"Please find your {doc_type} attached."), 'plain'))
         filepath = state.get("generated_doc_path")
-        with open(filepath, "rb") as f:
-            part = MIMEApplication(f.read(), Name=os.path.basename(filepath))
-        part['Content-Disposition'] = f'attachment; filename="{os.path.basename(filepath)}"'
-        msg.attach(part)
-        
+        if filepath and os.path.exists(filepath):
+            with open(filepath, "rb") as f:
+                part = MIMEApplication(f.read(), Name=os.path.basename(filepath))
+            part['Content-Disposition'] = f'attachment; filename="{os.path.basename(filepath)}"'
+            msg.attach(part)
         status_map = {"Quotation": "QUOTE_SENT", "Local Purchase Order": "LPO_SENT", "Tax Invoice": "INVOICE_SENT"}
         new_status = status_map.get(doc_type, "UNKNOWN")
         
