@@ -1,0 +1,15 @@
+nest_asyncio
+openpyxl
+weasyprint
+langgraph
+langchain-core
+<<<<<<< HEAD
+huggingface-hub
+langchain-community
+pydantic
+mcp
+=======
+langchain-google-genai
+langchain-chroma
+pydantic
+>>>>>>> 4f2d0e2 (Add converted Python automation script)
