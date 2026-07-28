@@ -566,7 +566,7 @@ async def email_poller(queue: asyncio.Queue):
     while True:
         new_emails = await asyncio.to_thread(fetch_unread_emails)
         for mail in new_emails: await queue.put(mail)
-        await asyncio.sleep(10)
+        await asyncio.sleep(3)
 
 async def agent_worker(queue: asyncio.Queue):
     global LAST_REQUEST_TIME
@@ -596,7 +596,7 @@ async def agent_worker(queue: asyncio.Queue):
             queue.task_done()
         except Exception as e:
             queue.task_done()
-        await asyncio.sleep(10)
+        await asyncio.sleep(3)
 
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -614,7 +614,5 @@ async def main():
     await asyncio.gather(email_poller(email_queue), agent_worker(email_queue))
 
 if __name__ == "__main__":
-    # Start background web server to satisfy Render's port scanning requirement
     threading.Thread(target=start_dummy_server, daemon=True).start()
-    # Run core async email loop
     asyncio.run(main())
