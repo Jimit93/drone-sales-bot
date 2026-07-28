@@ -5,21 +5,14 @@ import os
 import re
 import time
 import asyncio
-import imaplib
-import email
-import email.utils
-import smtplib
 import uuid
 import logging
 import sqlite3
 import difflib
 import base64
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import TypedDict, List, Optional, Dict, Any, Literal
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.application import MIMEApplication
 
 from pydantic import BaseModel, Field
 from weasyprint import HTML
@@ -27,7 +20,12 @@ from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 
-# Matplotlib backend fix for headless servers
+# Web Server Imports
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -36,14 +34,8 @@ import matplotlib.pyplot as plt
 # 1. CONFIGURATION & ENVIRONMENT
 # ==========================================
 os.environ["GOOGLE_API_KEY"] = os.environ.get("GEMINI_API_KEY", "")
-EMAIL_USER = os.environ.get("EMAIL_ACCOUNT", "jimit93@gmail.com")
-EMAIL_PASS = os.environ.get("EMAIL_PASSWORD", "")
-IMAP_SERVER = "imap.gmail.com"
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 587
 DB_FILE = "aerotech.db"
-
-LOW_STOCK_THRESHOLD = 5  # Reorder trigger limit
+LOW_STOCK_THRESHOLD = 5
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -66,15 +58,6 @@ INITIAL_INVENTORY = [
 def initialize_database():
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS orders (
-                email TEXT PRIMARY KEY,
-                client_name TEXT,
-                items TEXT,
-                status TEXT,
-                last_updated TEXT
-            )
-        """)
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS inventory (
                 product_name TEXT PRIMARY KEY,
@@ -100,51 +83,19 @@ def get_inventory_catalog():
         cursor.execute("SELECT product_name, selling_price, specs FROM inventory")
         return {row[0]: {"price": row[1], "specs": row[2]} for row in cursor.fetchall()}
 
-def get_client_status(email_addr: str) -> Optional[dict]:
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM orders WHERE LOWER(email) = ?", (email_addr.lower(),))
-        row = cursor.fetchone()
-        if row:
-            return {"Email": row[0], "Client Name": row[1], "Requested Items": row[2], "Status": row[3], "Last Updated": row[4]}
-    return None
-
-def update_client_status(email_addr: str, client_name: str, items: str, new_status: str):
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO orders (email, client_name, items, status, last_updated) 
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(email) DO UPDATE SET 
-            client_name=excluded.client_name, 
-            items=COALESCE(NULLIF(excluded.items, ''), orders.items), 
-            status=excluded.status, 
-            last_updated=excluded.last_updated
-        """, (email_addr.lower(), client_name, items, new_status, current_time))
-        conn.commit()
-
 initialize_database()
 
 # ==========================================
 # 3. AGENT STATE & STRUCTURED SCHEMAS
 # ==========================================
 class AgentState(TypedDict):
-    email_id: str
     sender_email: str
     display_name: str
-    email_subject: str
     email_body: str
-    current_db_status: Optional[str]
     intent: Literal["new_inquiry", "quote_approval", "delivery_confirmed", "invoice_response", "clarification_needed", "out_of_stock", "owner_analytics", "unrelated"]
-    company_name: Optional[str]
     requested_items: List[Dict[str, Any]]
     unrecognized_item_name: Optional[str]
-    generated_doc_path: Optional[str]
-    doc_type_sent: Optional[str]
     reply_message: Optional[str]
-    error_message: Optional[str]
-    reorder_items: List[str]
 
 class RequestedItem(BaseModel):
     product: str = Field(description="Product name or query mentioned by client")
@@ -153,20 +104,15 @@ class RequestedItem(BaseModel):
 class EmailExtraction(BaseModel):
     is_drone_inquiry: bool = Field(description="True ONLY if email is a genuine business inquiry OR an owner analytics/dashboard request.")
     intent: Literal["new_inquiry", "quote_approval", "delivery_confirmed", "invoice_response", "clarification_needed", "out_of_stock", "owner_analytics", "unrelated"] = Field(
-        description="Classify intent"
+        description="Classify intent strictly."
     )
     items: List[RequestedItem] = Field(default=[], description="List of items mentioned")
     unrecognized_item: Optional[str] = Field(default=None)
-    clarification_prompt: Optional[str] = Field(default=None)
 
 # ==========================================
 # 4. LANGGRAPH WORKFLOW NODES
 # ==========================================
 def extract_and_validate_intent(state: AgentState) -> dict:
-    logging.info(f"Analyzing intent for {state['display_name']} ({state['sender_email']})...")
-    db_record = get_client_status(state['sender_email'])
-    current_status = db_record["Status"] if db_record else "NEW_CLIENT"
-    
     catalog = get_inventory_catalog()
     catalog_summary = "\n".join([f"- {name}: ₹{data['price']}" for name, data in catalog.items()])
     
@@ -175,7 +121,7 @@ def extract_and_validate_intent(state: AgentState) -> dict:
     
     prompt = PromptTemplate.from_template(
         "You are an AI sales engineer for Aerotech Drones.\n"
-        "Sender: {sender_email}\nSubject: {subject}\nBody:\n{body}\n\n"
+        "Sender: {sender_email}\nMessage:\n{body}\n\n"
         "CRITICAL RULE: If the sender is 'jimit93@gmail.com' and they ask about stock, dashboard, report, or analytics, set intent to 'owner_analytics' and is_drone_inquiry to True.\n\n"
         "Available Catalog:\n{catalog_summary}\n\n"
         "Classify the intent strictly."
@@ -183,7 +129,6 @@ def extract_and_validate_intent(state: AgentState) -> dict:
     
     result = (prompt | structured_llm).invoke({
         "sender_email": state["sender_email"],
-        "subject": state["email_subject"],
         "body": state["email_body"],
         "catalog_summary": catalog_summary
     })
@@ -193,14 +138,7 @@ def extract_and_validate_intent(state: AgentState) -> dict:
         return {"intent": "owner_analytics"}
         
     if not result.is_drone_inquiry or result.intent == "unrelated":
-        return {"intent": "unrelated", "reply_message": None}
-
-    if result.intent == "clarification_needed":
-        return {"intent": "clarification_needed", "reply_message": result.clarification_prompt or "Could you specify the exact model?"}
-
-    if result.intent == "out_of_stock":
-        item_name = result.unrecognized_item or "the requested model"
-        return {"intent": "out_of_stock", "reply_message": f"Sorry sir, {item_name} is not available in our stock right now.", "unrecognized_item_name": item_name}
+        return {"intent": "unrelated", "reply_message": "Command not recognized."}
 
     extracted_items = []
     catalog_keys = list(catalog.keys())
@@ -217,27 +155,14 @@ def extract_and_validate_intent(state: AgentState) -> dict:
         if matched_name:
             extracted_items.append({"product": matched_name, "quantity": item.quantity})
 
-    if not extracted_items and db_record and db_record.get("Requested Items"):
-        for block in db_record["Requested Items"].split(", "):
-            if "x " in block:
-                qty, prod = block.split("x ", 1)
-                extracted_items.append({"product": prod, "quantity": int(qty)})
-
-    return {"current_db_status": current_status, "intent": result.intent, "requested_items": extracted_items}
+    return {"intent": result.intent, "requested_items": extracted_items}
 
 def route_workflow(state: AgentState) -> str:
     i = state["intent"]
     if i == "owner_analytics": return "generate_analytics"
-    elif i == "new_inquiry": return "generate_quote"
-    elif i == "quote_approval": return "generate_lpo"
-    elif i == "delivery_confirmed": return "ask_about_invoice"
-    elif i == "invoice_response": return "generate_invoice"
-    elif i in ["clarification_needed", "out_of_stock"]: return "dispatch_direct_message"
     else: return "end"
 
-# ----------------- STRICT OWNER COMMUNICATION & PURE HTML DASHBOARD -----------------
 def generate_analytics(state: AgentState) -> dict:
-    logging.info("Evaluating Owner Request...")
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT product_name, stock, sales, selling_price, buying_price FROM inventory")
@@ -246,7 +171,6 @@ def generate_analytics(state: AgentState) -> dict:
     body_text = state["email_body"].lower()
     wants_report = any(k in body_text for k in ["report", "dashboard", "analytics", "visual"])
 
-    # If asking for a report, generate the Base64-embedded HTML
     if wants_report:
         products = [row[0] for row in inv_data]
         stocks = [row[1] for row in inv_data]
@@ -255,16 +179,15 @@ def generate_analytics(state: AgentState) -> dict:
         total_rev = sum(s * sp for (_, _, s, sp, _) in inv_data)
         total_prof = sum(s * (sp - bp) for (_, _, s, sp, bp) in inv_data)
         
-        # Generate Matplotlib chart but DO NOT save as PNG file. Save to RAM buffer instead.
-        plt.figure(figsize=(10, 6), dpi=200)
+        plt.figure(figsize=(8, 4), dpi=150)
         x = range(len(products))
         width = 0.35
         plt.bar([p - width/2 for p in x], sales, width=width, label='Total Sold', color='#2ecc71')
         plt.bar([p + width/2 for p in x], stocks, width=width, label='Current Stock', color='#3498db')
-        plt.xlabel('Drone Models', fontsize=12, fontweight='bold', color='#333')
-        plt.ylabel('Units', fontsize=12, fontweight='bold', color='#333')
-        plt.title('Aerotech Drones - Live ERP Inventory & Sales Analytics', fontsize=14, fontweight='bold', pad=15, color='#2c3e50')
-        plt.xticks(x, [p.replace("DJI ", "") for p in products], rotation=45, ha='right', fontsize=10)
+        plt.xlabel('Models', fontsize=10, fontweight='bold', color='#333')
+        plt.ylabel('Units', fontsize=10, fontweight='bold', color='#333')
+        plt.title('Live ERP Inventory Analytics', fontsize=12, fontweight='bold', pad=10, color='#2c3e50')
+        plt.xticks(x, [p.replace("DJI ", "") for p in products], rotation=45, ha='right', fontsize=8)
         plt.legend(frameon=True, facecolor='#f9f9f9')
         plt.grid(axis='y', linestyle='--', alpha=0.5)
         plt.tight_layout()
@@ -274,342 +197,140 @@ def generate_analytics(state: AgentState) -> dict:
         plt.close()
         img_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
 
-        # Pure HTML generation with embedded chart
-        os.makedirs("./docs", exist_ok=True)
-        html_path = f"./docs/Aerotech_Dashboard_{datetime.now().strftime('%y%m%d_%H%M%S')}.html"
+        # Pure HTML response (No files saved, injected directly to chat)
         html_content = f"""<!DOCTYPE html>
         <html lang="en">
         <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Aerotech Executive Dashboard</title>
             <style>
-                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #f4f7f6; margin: 0; padding: 15px; color: #333; }}
-                .container {{ max-width: 900px; margin: auto; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }}
-                h1 {{ color: #2c3e50; font-size: 22px; border-bottom: 2px solid #3498db; padding-bottom: 10px; margin-top: 0; }}
-                .metrics-grid {{ display: flex; flex-direction: column; gap: 12px; margin-bottom: 20px; }}
-                @media (min-width: 600px) {{ .metrics-grid {{ flex-direction: row; }} }}
-                .metric-box {{ flex: 1; background: #3498db; color: white; padding: 15px; border-radius: 8px; text-align: center; }}
+                body {{ font-family: sans-serif; background: #fff; margin: 0; padding: 10px; color: #333; }}
+                .metrics-grid {{ display: flex; gap: 10px; margin-bottom: 15px; }}
+                .metric-box {{ flex: 1; background: #3498db; color: white; padding: 10px; border-radius: 8px; text-align: center; }}
                 .metric-box.profit {{ background: #2ecc71; }}
-                .metric-box h2 {{ margin: 0; font-size: 24px; }}
-                .metric-box p {{ margin: 5px 0 0 0; text-transform: uppercase; font-size: 11px; font-weight: bold; letter-spacing: 0.5px; }}
-                .chart-container {{ width: 100%; text-align: center; margin-top: 20px; }}
-                .chart-container img {{ max-width: 100%; height: auto; border-radius: 8px; border: 1px solid #ddd; }}
+                .metric-box h2 {{ margin: 0; font-size: 18px; }}
+                .metric-box p {{ margin: 5px 0 0 0; font-size: 10px; text-transform: uppercase; }}
+                img {{ max-width: 100%; border-radius: 8px; border: 1px solid #ddd; }}
             </style>
         </head>
         <body>
-            <div class="container">
-                <h1>Aerotech Executive Dashboard</h1>
-                <div class="metrics-grid">
-                    <div class="metric-box"><h2>₹{total_rev:,.2f}</h2><p>Gross Revenue</p></div>
-                    <div class="metric-box profit"><h2>₹{total_prof:,.2f}</h2><p>Net Profit</p></div>
-                </div>
-                <div class="chart-container">
-                    <h3>Visual Analytics Breakdown</h3>
-                    <!-- Image is natively embedded in the HTML file -->
-                    <img src="data:image/png;base64,{img_b64}" alt="Aerotech Analytics Chart">
-                </div>
+            <div class="metrics-grid">
+                <div class="metric-box"><h2>₹{total_rev:,.2f}</h2><p>Revenue</p></div>
+                <div class="metric-box profit"><h2>₹{total_prof:,.2f}</h2><p>Profit</p></div>
             </div>
+            <img src="data:image/png;base64,{img_b64}" alt="Chart">
         </body>
         </html>"""
-        
-        with open(html_path, "w", encoding="utf-8") as f:
-            f.write(html_content)
-
-        # Extreme constraint: Email body strictly under 50 tokens, starts and stops with answer.
-        return {"generated_doc_path": html_path, "doc_type_sent": "Analytics Dashboard", "reply_message": "HTML report attached."}
-
-    # If NOT asking for a report, provide direct text answer only (no attachment)
+        return {"reply_message": html_content}
     else:
+        # Strict 50-token answer
         targeted_text = ""
         for name, stock, sale, sp, bp in inv_data:
             if name.lower().replace("dji ", "") in body_text or name.lower() in body_text:
                 targeted_text += f"{name}: {stock} in stock.\n"
-                
-        if not targeted_text:
-            targeted_text = "Item not recognized in inventory."
-            
-        # Extreme constraint: Starts and stops with answer. No fluff.
-        return {"generated_doc_path": None, "doc_type_sent": "Analytics Dashboard", "reply_message": targeted_text.strip()}
+        if not targeted_text: targeted_text = "Item not recognized."
+        return {"reply_message": targeted_text.strip()}
 
-# ----------------- STANDARD DOCUMENT GENERATORS -----------------
-def generate_professional_pdf(doc_type: str, state: AgentState) -> str:
-    client_name = state.get("company_name", state.get("display_name", "Valued Client"))
-    requested_items = state.get("requested_items", [])
-    current_date = datetime.now()
-    catalog = get_inventory_catalog()
-    run_id = str(uuid.uuid4().hex[:6]).upper()
-
-    subtotal = 0.0
-    table_rows = ""
-    for idx, item in enumerate(requested_items, start=1):
-        prod = item.get("product", "Standard Drone")
-        qty = item.get("quantity", 1)
-        price = catalog.get(prod, {"price": 0.0})["price"]
-        specs = catalog.get(prod, {"specs": ""})["specs"]
-        line_total = qty * price
-        subtotal += line_total
-        table_rows += f"""<tr><td style="text-align:center;">{idx}</td><td><strong>{prod}</strong><br><span style="font-size:10px;color:#555;">{specs}</span></td><td style="text-align:center;">{qty}</td><td style="text-align:right;">₹{price:,.2f}</td><td style="text-align:right;">₹{line_total:,.2f}</td></tr>"""
-
-    gst = subtotal * 0.18
-    grand_total = subtotal + gst
-    html = f"""<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{{font-family:Helvetica;font-size:12px;padding:20px;}}</style></head><body>
-        <h2>AEROTECH DRONES - {doc_type.upper()}</h2>
-        <p><strong>To:</strong> {client_name}<br><strong>Date:</strong> {current_date.strftime("%d %b %Y")}<br><strong>Ref:</strong> {run_id}</p>
-        <table style="width:100%; border-collapse:collapse; margin-bottom:20px;" border="1" cellpadding="8">
-        <tr style="background:#f2f2f2;"><th>S.NO</th><th>ITEM & SPECS</th><th>QTY</th><th>RATE</th><th>AMOUNT</th></tr>
-        {table_rows}
-        </table>
-        <h3 style="text-align:right;">Total: ₹{grand_total:,.2f} (Incl 18% GST)</h3>
-        <p>Authorized Signatory<br>Jimit Talekar</p>
-    </body></html>"""
-    
-    os.makedirs("./docs", exist_ok=True)
-    path = f"./docs/{doc_type}_{run_id}.pdf"
-    HTML(string=html).write_pdf(path)
-    return path
-
-def generate_quote(state: AgentState) -> dict:
-    return {"generated_doc_path": generate_professional_pdf("Quotation", state), "doc_type_sent": "Quotation"}
-
-def generate_lpo(state: AgentState) -> dict:
-    return {"generated_doc_path": generate_professional_pdf("LPO", state), "doc_type_sent": "Local Purchase Order"}
-
-def ask_about_invoice(state: AgentState) -> dict:
-    return {"doc_type_sent": "Invoice Inquiry", "reply_message": "Sir, have you received the delivery?"}
-
-def generate_invoice(state: AgentState) -> dict:
-    logging.info("Generating Tax Invoice & Checking Stock Thresholds...")
-    requested_items = state.get("requested_items", [])
-    reorder_list = []
-    
-    with sqlite3.connect(DB_FILE) as conn:
-        cursor = conn.cursor()
-        for item in requested_items:
-            prod = item.get("product")
-            qty = item.get("quantity", 1)
-            
-            cursor.execute("""
-                UPDATE inventory 
-                SET stock = MAX(stock - ?, 0), sales = sales + ? 
-                WHERE product_name = ?
-            """, (qty, qty, prod))
-            
-            cursor.execute("SELECT stock FROM inventory WHERE product_name = ?", (prod,))
-            new_stock = cursor.fetchone()[0]
-            if new_stock <= LOW_STOCK_THRESHOLD:
-                reorder_list.append(f"{prod} (Current Stock: {new_stock})")
-                
-        conn.commit()
-        
-    return {
-        "generated_doc_path": generate_professional_pdf("Invoice", state), 
-        "doc_type_sent": "Tax Invoice", 
-        "reply_message": "Here is your final tax invoice sir.",
-        "reorder_items": reorder_list
-    }
-
-# ----------------- DISPATCHERS -----------------
-def dispatch_direct_message(state: AgentState) -> dict:
-    msg = MIMEMultipart()
-    msg['From'] = EMAIL_USER
-    msg['To'] = state["sender_email"]
-    msg['Subject'] = f"Re: {state['email_subject']}"
-    msg.attach(MIMEText(state.get("reply_message", ""), 'plain'))
-    try:
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
-        server.starttls()
-        server.login(EMAIL_USER, EMAIL_PASS)
-        server.send_message(msg)
-        server.quit()
-    except Exception as e: pass
-    return {}
-
-def dispatch_and_update(state: AgentState) -> dict:
-    doc_type = state["doc_type_sent"]
-    msg = MIMEMultipart()
-    msg['From'] = EMAIL_USER
-    msg['To'] = state["sender_email"]
-    
-    if doc_type == "Invoice Inquiry":
-        msg['Subject'] = "Delivery Status"
-        msg.attach(MIMEText(state["reply_message"], 'plain'))
-        new_status = "ASKED_INVOICE_STATUS"
-    elif doc_type == "Analytics Dashboard":
-        msg['Subject'] = "Aerotech Inventory Update"
-        msg.attach(MIMEText(state["reply_message"], 'plain'))
-        filepath = state.get("generated_doc_path")
-        # Only attach HTML if it was generated (i.e. user explicitly asked for report)
-        if filepath and os.path.exists(filepath):
-            with open(filepath, "rb") as f:
-                part = MIMEApplication(f.read(), Name=os.path.basename(filepath))
-            part['Content-Disposition'] = f'attachment; filename="{os.path.basename(filepath)}"'
-            msg.attach(part)
-        new_status = "ANALYTICS_SENT"
-    else:
-        msg['Subject'] = f"Your {doc_type} from Aerotech Drones"
-        msg.attach(MIMEText(state.get("reply_message", f"Please find your {doc_type} attached."), 'plain'))
-        filepath = state.get("generated_doc_path")
-        if filepath and os.path.exists(filepath):
-            with open(filepath, "rb") as f:
-                part = MIMEApplication(f.read(), Name=os.path.basename(filepath))
-            part['Content-Disposition'] = f'attachment; filename="{os.path.basename(filepath)}"'
-            msg.attach(part)
-        status_map = {"Quotation": "QUOTE_SENT", "Local Purchase Order": "LPO_SENT", "Tax Invoice": "INVOICE_SENT"}
-        new_status = status_map.get(doc_type, "UNKNOWN")
-        
-    try:
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
-        server.starttls()
-        server.login(EMAIL_USER, EMAIL_PASS)
-        server.send_message(msg)
-    except Exception as e: pass
-
-    if doc_type != "Analytics Dashboard":
-        items_str = ", ".join([f"{i['quantity']}x {i['product']}" for i in state["requested_items"]])
-        update_client_status(state["sender_email"], state["display_name"], items_str, new_status)
-
-    reorder_items = state.get("reorder_items", [])
-    if reorder_items:
-        alert_msg = MIMEMultipart()
-        alert_msg['From'] = EMAIL_USER
-        alert_msg['To'] = "jimit93@gmail.com" 
-        alert_msg['Subject'] = "URGENT: Restock Alert"
-        body = "Alert:\n"
-        for item in reorder_items:
-            body += f"{item}\n"
-        alert_msg.attach(MIMEText(body, 'plain'))
-        try:
-            server.send_message(alert_msg)
-        except Exception: pass
-
-    try:
-        server.quit()
-    except Exception: pass
-        
-    return {}
-
-# ----------------- GRAPH COMPILATION -----------------
+# Compile Graph
 workflow = StateGraph(AgentState)
 workflow.add_node("extract", extract_and_validate_intent)
 workflow.add_node("generate_analytics", generate_analytics)
-workflow.add_node("generate_quote", generate_quote)
-workflow.add_node("generate_lpo", generate_lpo)
-workflow.add_node("ask_about_invoice", ask_about_invoice)
-workflow.add_node("generate_invoice", generate_invoice)
-workflow.add_node("dispatch_direct_message", dispatch_direct_message)
-workflow.add_node("dispatch", dispatch_and_update)
-
 workflow.set_entry_point("extract")
-workflow.add_conditional_edges("extract", route_workflow, {
-    "generate_analytics": "generate_analytics",
-    "generate_quote": "generate_quote",
-    "generate_lpo": "generate_lpo", 
-    "ask_about_invoice": "ask_about_invoice",
-    "generate_invoice": "generate_invoice",
-    "dispatch_direct_message": "dispatch_direct_message",
-    "end": END
-})
-
-workflow.add_edge("generate_analytics", "dispatch")
-workflow.add_edge("generate_quote", "dispatch")
-workflow.add_edge("generate_lpo", "dispatch")
-workflow.add_edge("ask_about_invoice", "dispatch")
-workflow.add_edge("generate_invoice", "dispatch")
-workflow.add_edge("dispatch_direct_message", END)
-workflow.add_edge("dispatch", END)
-
-app = workflow.compile()
+workflow.add_conditional_edges("extract", route_workflow, {"generate_analytics": "generate_analytics", "end": END})
+workflow.add_edge("generate_analytics", END)
+app_logic = workflow.compile()
 
 # ==========================================
-# 5. ASYNC POLLER & RATE LIMITER
+# 5. FASTAPI WEB SERVER & CHAT INTERFACE
 # ==========================================
-LAST_CHECKED_ID = None
-LAST_REQUEST_TIME = 0.0
-RATE_LIMIT_SECONDS = 60.0  
+app_api = FastAPI()
+app_api.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-def fetch_unread_emails():
-    global LAST_CHECKED_ID
-    emails_data = []
-    try:
-        mail = imaplib.IMAP4_SSL(IMAP_SERVER)
-        mail.login(EMAIL_USER, EMAIL_PASS)
-        mail.select('INBOX') 
-        status, messages = mail.uid('search', None, 'UNSEEN')
-        if status == 'OK' and messages[0]:
-            uids = messages[0].split()
-            if LAST_CHECKED_ID is None:
-                LAST_CHECKED_ID = int(uids[-1])
-                mail.logout()
-                return []
-            new_uids = [uid for uid in uids if int(uid) > LAST_CHECKED_ID]
-            for uid in new_uids[-3:]:
-                LAST_CHECKED_ID = max(LAST_CHECKED_ID, int(uid))
-                res, msg_data = mail.uid('fetch', uid, '(RFC822)')
-                mail.uid('store', uid, '+FLAGS', '\\Seen')
-                for response_part in msg_data:
-                    if isinstance(response_part, tuple):
-                        msg = email.message_from_bytes(response_part[1])
-                        raw_from = msg.get('from', '')
-                        display_name, sender_email = email.utils.parseaddr(raw_from)
-                        body = ""
-                        if msg.is_multipart():
-                            for part in msg.walk():
-                                if part.get_content_type() == "text/plain":
-                                    body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                                    break
-                        else:
-                            body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+class ChatRequest(BaseModel):
+    message: str
 
-                        emails_data.append({
-                            "email_id": uid.decode(), "sender_email": sender_email,
-                            "display_name": display_name, "email_subject": msg.get('subject', ''), "email_body": body
-                        })
-        else:
-            if LAST_CHECKED_ID is None: LAST_CHECKED_ID = 0
-        mail.logout()
-    except Exception as e: pass
-    return emails_data
+@app_api.get("/", response_class=HTMLResponse)
+def serve_ui():
+    return """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+        <title>Aerotech AI Terminal</title>
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #0f172a; color: white; margin: 0; display: flex; flex-direction: column; height: 100vh; }
+            .header { background: #1e293b; padding: 15px; text-align: center; font-weight: bold; font-size: 1.2rem; border-bottom: 1px solid #334155; }
+            .chat-container { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 15px; }
+            .msg { max-width: 85%; padding: 12px 16px; border-radius: 12px; font-size: 15px; line-height: 1.5; word-wrap: break-word; }
+            .user { background: #3b82f6; align-self: flex-end; border-bottom-right-radius: 2px; }
+            .bot { background: #1e293b; align-self: flex-start; border-bottom-left-radius: 2px; border: 1px solid #334155; }
+            .input-area { padding: 15px; background: #1e293b; display: flex; gap: 10px; border-top: 1px solid #334155; }
+            input { flex: 1; padding: 12px; border-radius: 8px; border: none; background: #0f172a; color: white; font-size: 16px; outline: none; }
+            button { background: #3b82f6; color: white; border: none; padding: 12px 20px; border-radius: 8px; font-weight: bold; cursor: pointer; }
+            button:active { background: #2563eb; }
+            iframe { width: 100%; height: 400px; border: none; border-radius: 8px; background: white; margin-top: 10px;}
+        </style>
+    </head>
+    <body>
+        <div class="header">Aerotech AI ERP</div>
+        <div class="chat-container" id="chat"></div>
+        <div class="input-area">
+            <input type="text" id="userInput" placeholder="Ask about stock or request dashboard..." autocomplete="off" onkeypress="if(event.key === 'Enter') sendMessage()">
+            <button onclick="sendMessage()">Send</button>
+        </div>
 
-async def email_poller(queue: asyncio.Queue):
-    while True:
-        new_emails = await asyncio.to_thread(fetch_unread_emails)
-        for mail in new_emails: await queue.put(mail)
-        await asyncio.sleep(10)
-
-async def agent_worker(queue: asyncio.Queue):
-    global LAST_REQUEST_TIME
-    while True:
-        try:
-            mail_data = await queue.get()
-            
-            current_time = time.time()
-            elapsed = current_time - LAST_REQUEST_TIME
-            if elapsed < RATE_LIMIT_SECONDS:
-                wait_time = RATE_LIMIT_SECONDS - elapsed
-                await asyncio.sleep(wait_time)
-            
-            LAST_REQUEST_TIME = time.time()
-
-            initial_state = {
-                "email_id": mail_data.get("email_id", ""), 
-                "sender_email": mail_data.get("sender_email", ""),
-                "display_name": mail_data.get("display_name", ""), 
-                "email_subject": mail_data.get("email_subject", ""),
-                "email_body": mail_data.get("email_body", ""), 
-                "current_db_status": None, "intent": "unrelated", "company_name": mail_data.get("display_name", ""), 
-                "requested_items": [], "unrecognized_item_name": None, "generated_doc_path": None,
-                "doc_type_sent": None, "reply_message": None, "error_message": None, "reorder_items": []
+        <script>
+            function appendMessage(sender, text) {
+                const chat = document.getElementById('chat');
+                const div = document.createElement('div');
+                div.className = 'msg ' + sender;
+                
+                if (text.includes("<!DOCTYPE html>")) {
+                    const iframe = document.createElement('iframe');
+                    iframe.srcdoc = text;
+                    div.appendChild(iframe);
+                } else {
+                    div.innerText = text;
+                }
+                
+                chat.appendChild(div);
+                chat.scrollTop = chat.scrollHeight;
             }
-            await asyncio.to_thread(app.invoke, initial_state)
-            queue.task_done()
-        except Exception as e:
-            queue.task_done()
-        await asyncio.sleep(10)
 
-async def main():
-    email_queue = asyncio.Queue()
-    await asyncio.gather(email_poller(email_queue), agent_worker(email_queue))
+            async function sendMessage() {
+                const input = document.getElementById('userInput');
+                const text = input.value.trim();
+                if (!text) return;
+                
+                appendMessage('user', text);
+                input.value = '';
+                
+                const response = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: text })
+                });
+                
+                const data = await response.json();
+                appendMessage('bot', data.reply);
+            }
+        </script>
+    </body>
+    </html>
+    """
+
+@app_api.post("/api/chat")
+async def process_chat(req: ChatRequest):
+    initial_state = {
+        "sender_email": "jimit93@gmail.com",
+        "display_name": "Jimit",
+        "email_body": req.message,
+        "intent": "unrelated",
+        "requested_items": [],
+        "reply_message": ""
+    }
+    result = await asyncio.to_thread(app_logic.invoke, initial_state)
+    return {"reply": result.get("reply_message", "Processing completed.")}
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Local testing fallback
+    uvicorn.run(app_api, host="0.0.0.0", port=10000)
