@@ -14,6 +14,8 @@ import logging
 import sqlite3
 import difflib
 import base64
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from io import BytesIO
 from datetime import datetime, timedelta
 from typing import TypedDict, List, Optional, Dict, Any, Literal
@@ -35,7 +37,6 @@ import matplotlib.pyplot as plt
 # ==========================================
 # 1. CONFIGURATION & ENVIRONMENT
 # ==========================================
-# Make sure your system environment variables have GEMINI_API_KEY and your email credentials set
 os.environ["GOOGLE_API_KEY"] = os.environ.get("GEMINI_API_KEY", "")
 EMAIL_USER = os.environ.get("EMAIL_ACCOUNT", "jimit93@gmail.com")
 EMAIL_PASS = os.environ.get("EMAIL_PASSWORD", "")
@@ -171,15 +172,12 @@ def extract_and_validate_intent(state: AgentState) -> dict:
     body_lower = state["email_body"].strip().lower()
 
     # --- STRICT OWNER COMMAND BYPASS ---
-    # If the email body starts with "jimit:", it skips the LLM and processes the command immediately
     if body_lower.startswith("jimit:"):
         command = body_lower.replace("jimit:", "").strip()
         logging.info(f"Owner command detected: {command}")
-        # Determine if it's a dashboard/report request
         if any(k in command for k in ["report", "dashboard", "analytics", "stock", "visual"]):
             return {"intent": "owner_analytics", "current_db_status": current_status, "requested_items": []}
         else:
-            # Fallback if the command isn't recognized
             return {"intent": "unrelated", "reply_message": "Command received but not recognized."}
 
     # --- NORMAL CLIENT INQUIRY PROCESSING ---
@@ -296,7 +294,6 @@ def generate_analytics(state: AgentState) -> dict:
             .container {{ width: 100%; max-width: 900px; margin: auto; background: white; padding: 15px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }}
             h1 {{ color: #2c3e50; font-size: 20px; border-bottom: 2px solid #3498db; padding-bottom: 8px; margin-top: 0; text-align: center; }}
             .metrics-grid {{ display: flex; flex-direction: column; gap: 10px; margin-bottom: 20px; }}
-            /* Standard Mobile View First, Scales to row for tablets/desktop */
             @media (min-width: 600px) {{ .metrics-grid {{ flex-direction: row; gap: 15px; }} }}
             .metric-box {{ flex: 1; background: #3498db; color: white; padding: 15px; border-radius: 8px; text-align: center; }}
             .metric-box.profit {{ background: #2ecc71; }}
@@ -516,11 +513,11 @@ workflow.add_edge("dispatch", END)
 app = workflow.compile()
 
 # ==========================================
-# 5. ASYNC POLLER & RATE LIMITER
+# 5. ASYNC POLLER & DUMMY RENDER WEB SERVER
 # ==========================================
 LAST_CHECKED_ID = None
 LAST_REQUEST_TIME = 0.0
-RATE_LIMIT_SECONDS = 60.0  
+RATE_LIMIT_SECONDS = 5.0  
 
 def fetch_unread_emails():
     global LAST_CHECKED_ID
@@ -601,9 +598,23 @@ async def agent_worker(queue: asyncio.Queue):
             queue.task_done()
         await asyncio.sleep(10)
 
+class DummyHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Aerotech Headless Email Bot is Active!")
+
+def start_dummy_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), DummyHandler)
+    server.serve_forever()
+
 async def main():
     email_queue = asyncio.Queue()
     await asyncio.gather(email_poller(email_queue), agent_worker(email_queue))
 
 if __name__ == "__main__":
+    # Start background web server to satisfy Render's port scanning requirement
+    threading.Thread(target=start_dummy_server, daemon=True).start()
+    # Run core async email loop
     asyncio.run(main())
