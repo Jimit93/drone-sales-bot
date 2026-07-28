@@ -521,9 +521,10 @@ app = workflow.compile()
 LAST_CHECKED_ID = None
 LAST_REQUEST_TIME = 0.0
 RATE_LIMIT_SECONDS = 5.0  
+PROCESSED_UIDS = set()
 
 def fetch_unread_emails():
-    global LAST_CHECKED_ID
+    global LAST_CHECKED_ID, PROCESSED_UIDS
     emails_data = []
     try:
         mail = imaplib.IMAP4_SSL(IMAP_SERVER)
@@ -538,19 +539,24 @@ def fetch_unread_emails():
                 return []
             new_uids = [uid for uid in uids if int(uid) > LAST_CHECKED_ID]
             for uid in new_uids[-3:]:
+                if uid in PROCESSED_UIDS:
+                    continue
+                PROCESSED_UIDS.add(uid)
+                
                 LAST_CHECKED_ID = max(LAST_CHECKED_ID, int(uid))
                 res, msg_data = mail.uid('fetch', uid, '(RFC822)')
-                mail.uid('store', uid, '+FLAGS', '\\Seen')
+                
+                # Forces instant read status on Gmail
+                mail.uid('store', uid, '+FLAGS', '(\\Seen)')
+                
                 for response_part in msg_data:
                     if isinstance(response_part, tuple):
                         msg = email.message_from_bytes(response_part[1])
                         raw_from = msg.get('from', '')
                         display_name, sender_email = email.utils.parseaddr(raw_from)
                         
-                        # ----- IGNORE AUTOMATED JUNK/RENDER EMAILS -----
                         if any(domain in sender_email.lower() for domain in ["render", "no-reply", "temu", "support"]):
                             continue
-                        # -----------------------------------------------
 
                         body = ""
                         if msg.is_multipart():
