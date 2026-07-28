@@ -68,7 +68,6 @@ INITIAL_INVENTORY = [
 def initialize_database():
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
-        # Drop old tables to prevent schema mismatch errors on Render storage
         cursor.execute("DROP TABLE IF EXISTS inventory")
         cursor.execute("DROP TABLE IF EXISTS orders")
         
@@ -186,7 +185,8 @@ def extract_and_validate_intent(state: AgentState) -> dict:
     catalog = get_inventory_catalog()
     catalog_summary = "\n".join([f"- {name}: ₹{data['price']}" for name, data in catalog.items()])
     
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+    # Switched to Gemini 3.1 Flash-Lite
+    llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite", temperature=0)
     structured_llm = llm.with_structured_output(EmailExtraction)
     
     prompt = PromptTemplate.from_template(
@@ -520,7 +520,7 @@ app = workflow.compile()
 # ==========================================
 LAST_CHECKED_ID = None
 LAST_REQUEST_TIME = 0.0
-RATE_LIMIT_SECONDS = 60.0 
+RATE_LIMIT_SECONDS = 15.0  # Increased to prevent rate limits
 PROCESSED_UIDS = set()
 
 def fetch_unread_emails():
@@ -546,7 +546,6 @@ def fetch_unread_emails():
                 LAST_CHECKED_ID = max(LAST_CHECKED_ID, int(uid))
                 res, msg_data = mail.uid('fetch', uid, '(RFC822)')
                 
-                # Forces instant read status on Gmail
                 mail.uid('store', uid, '+FLAGS', '(\\Seen)')
                 
                 for response_part in msg_data:
@@ -582,7 +581,7 @@ async def email_poller(queue: asyncio.Queue):
     while True:
         new_emails = await asyncio.to_thread(fetch_unread_emails)
         for mail in new_emails: await queue.put(mail)
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
 
 async def agent_worker(queue: asyncio.Queue):
     global LAST_REQUEST_TIME
@@ -613,7 +612,7 @@ async def agent_worker(queue: asyncio.Queue):
         except Exception as e:
             logging.error(f"Agent Worker Error: {e}")
             queue.task_done()
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
 
 class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
