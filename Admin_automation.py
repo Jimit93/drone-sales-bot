@@ -13,12 +13,13 @@ import uuid
 import logging
 import sqlite3
 import difflib
+import base64
+from io import BytesIO
 from datetime import datetime, timedelta
 from typing import TypedDict, List, Optional, Dict, Any, Literal
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
-from email.mime.image import MIMEImage
 
 from pydantic import BaseModel, Field
 from weasyprint import HTML
@@ -143,7 +144,7 @@ class AgentState(TypedDict):
     doc_type_sent: Optional[str]
     reply_message: Optional[str]
     error_message: Optional[str]
-    reorder_items: List[str]  # New: Tracks items that hit the low-stock threshold
+    reorder_items: List[str]
 
 class RequestedItem(BaseModel):
     product: str = Field(description="Product name or query mentioned by client")
@@ -152,7 +153,7 @@ class RequestedItem(BaseModel):
 class EmailExtraction(BaseModel):
     is_drone_inquiry: bool = Field(description="True ONLY if email is a genuine business inquiry OR an owner analytics/dashboard request.")
     intent: Literal["new_inquiry", "quote_approval", "delivery_confirmed", "invoice_response", "clarification_needed", "out_of_stock", "owner_analytics", "unrelated"] = Field(
-        description="Classify intent: new_inquiry, quote_approval, delivery_confirmed, invoice_response, clarification_needed, out_of_stock, owner_analytics, unrelated"
+        description="Classify intent"
     )
     items: List[RequestedItem] = Field(default=[], description="List of items mentioned")
     unrecognized_item: Optional[str] = Field(default=None)
@@ -175,7 +176,7 @@ def extract_and_validate_intent(state: AgentState) -> dict:
     prompt = PromptTemplate.from_template(
         "You are an AI sales engineer for Aerotech Drones.\n"
         "Sender: {sender_email}\nSubject: {subject}\nBody:\n{body}\n\n"
-        "CRITICAL RULE: If the sender is 'jimit93@gmail.com' and they are asking about stock, dashboard, sales, analytics, or report, you MUST set intent to 'owner_analytics' and is_drone_inquiry to True.\n\n"
+        "CRITICAL RULE: If the sender is 'jimit93@gmail.com' and they ask about stock, dashboard, report, or analytics, set intent to 'owner_analytics' and is_drone_inquiry to True.\n\n"
         "Available Catalog:\n{catalog_summary}\n\n"
         "Classify the intent strictly."
     )
@@ -234,98 +235,102 @@ def route_workflow(state: AgentState) -> str:
     elif i in ["clarification_needed", "out_of_stock"]: return "dispatch_direct_message"
     else: return "end"
 
-# ----------------- MOBILE-FRIENDLY BI DASHBOARD -----------------
+# ----------------- STRICT OWNER COMMUNICATION & PURE HTML DASHBOARD -----------------
 def generate_analytics(state: AgentState) -> dict:
-    logging.info("Generating Mobile-Friendly BI Dashboard & Visuals...")
+    logging.info("Evaluating Owner Request...")
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT product_name, stock, sales, selling_price, buying_price FROM inventory")
         inv_data = cursor.fetchall()
 
-    products = [row[0] for row in inv_data]
-    stocks = [row[1] for row in inv_data]
-    sales = [row[2] for row in inv_data]
-
-    total_rev = sum(s * sp for (_, _, s, sp, _) in inv_data)
-    total_prof = sum(s * (sp - bp) for (_, _, s, sp, bp) in inv_data)
-
     body_text = state["email_body"].lower()
-    targeted_text = ""
-    for name, stock, sale, sp, bp in inv_data:
-        if name.lower().replace("dji ", "") in body_text or name.lower() in body_text:
-            targeted_text += f"• **{name}**: {stock} now in stock (Total Sold: {sale})\n"
+    wants_report = any(k in body_text for k in ["report", "dashboard", "analytics", "visual"])
 
-    if not targeted_text or "dashboard" in body_text or "visual" in body_text or "report" in body_text:
-        targeted_text = "Full Inventory Stock Summary:\n"
+    # If asking for a report, generate the Base64-embedded HTML
+    if wants_report:
+        products = [row[0] for row in inv_data]
+        stocks = [row[1] for row in inv_data]
+        sales = [row[2] for row in inv_data]
+
+        total_rev = sum(s * sp for (_, _, s, sp, _) in inv_data)
+        total_prof = sum(s * (sp - bp) for (_, _, s, sp, bp) in inv_data)
+        
+        # Generate Matplotlib chart but DO NOT save as PNG file. Save to RAM buffer instead.
+        plt.figure(figsize=(10, 6), dpi=200)
+        x = range(len(products))
+        width = 0.35
+        plt.bar([p - width/2 for p in x], sales, width=width, label='Total Sold', color='#2ecc71')
+        plt.bar([p + width/2 for p in x], stocks, width=width, label='Current Stock', color='#3498db')
+        plt.xlabel('Drone Models', fontsize=12, fontweight='bold', color='#333')
+        plt.ylabel('Units', fontsize=12, fontweight='bold', color='#333')
+        plt.title('Aerotech Drones - Live ERP Inventory & Sales Analytics', fontsize=14, fontweight='bold', pad=15, color='#2c3e50')
+        plt.xticks(x, [p.replace("DJI ", "") for p in products], rotation=45, ha='right', fontsize=10)
+        plt.legend(frameon=True, facecolor='#f9f9f9')
+        plt.grid(axis='y', linestyle='--', alpha=0.5)
+        plt.tight_layout()
+
+        buf = BytesIO()
+        plt.savefig(buf, format='png')
+        plt.close()
+        img_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+
+        # Pure HTML generation with embedded chart
+        os.makedirs("./docs", exist_ok=True)
+        html_path = f"./docs/Aerotech_Dashboard_{datetime.now().strftime('%y%m%d_%H%M%S')}.html"
+        html_content = f"""<!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Aerotech Executive Dashboard</title>
+            <style>
+                body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #f4f7f6; margin: 0; padding: 15px; color: #333; }}
+                .container {{ max-width: 900px; margin: auto; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }}
+                h1 {{ color: #2c3e50; font-size: 22px; border-bottom: 2px solid #3498db; padding-bottom: 10px; margin-top: 0; }}
+                .metrics-grid {{ display: flex; flex-direction: column; gap: 12px; margin-bottom: 20px; }}
+                @media (min-width: 600px) {{ .metrics-grid {{ flex-direction: row; }} }}
+                .metric-box {{ flex: 1; background: #3498db; color: white; padding: 15px; border-radius: 8px; text-align: center; }}
+                .metric-box.profit {{ background: #2ecc71; }}
+                .metric-box h2 {{ margin: 0; font-size: 24px; }}
+                .metric-box p {{ margin: 5px 0 0 0; text-transform: uppercase; font-size: 11px; font-weight: bold; letter-spacing: 0.5px; }}
+                .chart-container {{ width: 100%; text-align: center; margin-top: 20px; }}
+                .chart-container img {{ max-width: 100%; height: auto; border-radius: 8px; border: 1px solid #ddd; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>Aerotech Executive Dashboard</h1>
+                <div class="metrics-grid">
+                    <div class="metric-box"><h2>₹{total_rev:,.2f}</h2><p>Gross Revenue</p></div>
+                    <div class="metric-box profit"><h2>₹{total_prof:,.2f}</h2><p>Net Profit</p></div>
+                </div>
+                <div class="chart-container">
+                    <h3>Visual Analytics Breakdown</h3>
+                    <!-- Image is natively embedded in the HTML file -->
+                    <img src="data:image/png;base64,{img_b64}" alt="Aerotech Analytics Chart">
+                </div>
+            </div>
+        </body>
+        </html>"""
+        
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+
+        # Extreme constraint: Email body strictly under 50 tokens, starts and stops with answer.
+        return {"generated_doc_path": html_path, "doc_type_sent": "Analytics Dashboard", "reply_message": "HTML report attached."}
+
+    # If NOT asking for a report, provide direct text answer only (no attachment)
+    else:
+        targeted_text = ""
         for name, stock, sale, sp, bp in inv_data:
-            targeted_text += f"• **{name}**: {stock} in stock | Sold: {sale}\n"
-
-    plt.figure(figsize=(10, 6), dpi=300)
-    x = range(len(products))
-    width = 0.35
-
-    plt.bar([p - width/2 for p in x], sales, width=width, label='Total Sold', color='#2ecc71')
-    plt.bar([p + width/2 for p in x], stocks, width=width, label='Current Stock', color='#3498db')
-
-    plt.xlabel('Drone Models', fontsize=12, fontweight='bold', color='#333')
-    plt.ylabel('Units', fontsize=12, fontweight='bold', color='#333')
-    plt.title('Aerotech Drones - Live ERP Inventory & Sales Analytics', fontsize=14, fontweight='bold', pad=15, color='#2c3e50')
-    plt.xticks(x, [p.replace("DJI ", "") for p in products], rotation=45, ha='right', fontsize=10)
-    plt.legend(frameon=True, facecolor='#f9f9f9')
-    plt.grid(axis='y', linestyle='--', alpha=0.5)
-    plt.tight_layout()
-
-    os.makedirs("./docs", exist_ok=True)
-    chart_path = f"./docs/aerotech_analytics_{datetime.now().strftime('%y%m%d_%H%M%S')}.png"
-    plt.savefig(chart_path)
-    plt.close()
-
-    html_path = f"./docs/Aerotech_Dashboard_{datetime.now().strftime('%y%m%d_%H%M%S')}.html"
-    html_content = f"""<!DOCTYPE html>
-    <html lang="en">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Aerotech Executive Dashboard</title>
-        <style>
-            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f4f7f6; margin: 0; padding: 15px; color: #333; }}
-            .container {{ max-width: 900px; margin: auto; background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }}
-            h1 {{ color: #2c3e50; font-size: 22px; border-bottom: 2px solid #3498db; padding-bottom: 10px; margin-top: 0; }}
-            .metrics-grid {{ display: flex; flex-direction: column; gap: 12px; margin-bottom: 20px; }}
-            @media (min-width: 600px) {{ .metrics-grid {{ flex-direction: row; }} }}
-            .metric-box {{ flex: 1; background: #3498db; color: white; padding: 15px; border-radius: 8px; text-align: center; }}
-            .metric-box.profit {{ background: #2ecc71; }}
-            .metric-box h2 {{ margin: 0; font-size: 24px; }}
-            .metric-box p {{ margin: 5px 0 0 0; text-transform: uppercase; font-size: 11px; font-weight: bold; letter-spacing: 0.5px; }}
-            .chart-container {{ width: 100%; text-align: center; margin-top: 20px; }}
-            .chart-container img {{ max-width: 100%; height: auto; border-radius: 8px; border: 1px solid #ddd; }}
-            .stock-list {{ background: #fdfbf7; border-left: 4px solid #f39c12; padding: 12px; font-size: 14px; line-height: 1.6; border-radius: 4px; }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>Aerotech Executive Dashboard</h1>
-            <div class="metrics-grid">
-                <div class="metric-box"><h2>₹{total_rev:,.2f}</h2><p>Gross Revenue</p></div>
-                <div class="metric-box profit"><h2>₹{total_prof:,.2f}</h2><p>Net Profit</p></div>
-            </div>
-            <h3>Inventory Status Overview</h3>
-            <div class="stock-list">
-                {targeted_text.replace(chr(10), '<br>')}
-            </div>
-            <div class="chart-container">
-                <h3>Visual Analytics Breakdown</h3>
-                <img src="aerotech_analytics.png" alt="Aerotech Analytics Chart">
-            </div>
-        </div>
-    </body>
-    </html>"""
-    
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(html_content)
-
-    reply_text = f"Dear Jimit,\n\nHere is your executive analytics report:\n\n{targeted_text}\n\nA mobile-responsive HTML dashboard and a high-resolution visual chart have been attached.\n\nBest Regards,\nAerotech AI ERP"
-    return {"generated_doc_path": chart_path, "doc_type_sent": "Analytics Dashboard", "reply_message": reply_text}
+            if name.lower().replace("dji ", "") in body_text or name.lower() in body_text:
+                targeted_text += f"{name}: {stock} in stock.\n"
+                
+        if not targeted_text:
+            targeted_text = "Item not recognized in inventory."
+            
+        # Extreme constraint: Starts and stops with answer. No fluff.
+        return {"generated_doc_path": None, "doc_type_sent": "Analytics Dashboard", "reply_message": targeted_text.strip()}
 
 # ----------------- STANDARD DOCUMENT GENERATORS -----------------
 def generate_professional_pdf(doc_type: str, state: AgentState) -> str:
@@ -384,14 +389,12 @@ def generate_invoice(state: AgentState) -> dict:
             prod = item.get("product")
             qty = item.get("quantity", 1)
             
-            # 1. Deduct Inventory
             cursor.execute("""
                 UPDATE inventory 
                 SET stock = MAX(stock - ?, 0), sales = sales + ? 
                 WHERE product_name = ?
             """, (qty, qty, prod))
             
-            # 2. Check if reorder is needed
             cursor.execute("SELECT stock FROM inventory WHERE product_name = ?", (prod,))
             new_stock = cursor.fetchone()[0]
             if new_stock <= LOW_STOCK_THRESHOLD:
@@ -428,15 +431,15 @@ def dispatch_and_update(state: AgentState) -> dict:
     msg['From'] = EMAIL_USER
     msg['To'] = state["sender_email"]
     
-    # 1. Prepare and Send Client Email
     if doc_type == "Invoice Inquiry":
         msg['Subject'] = "Delivery Status"
         msg.attach(MIMEText(state["reply_message"], 'plain'))
         new_status = "ASKED_INVOICE_STATUS"
     elif doc_type == "Analytics Dashboard":
-        msg['Subject'] = "Aerotech Executive Stock & Visual Dashboard"
+        msg['Subject'] = "Aerotech Inventory Update"
         msg.attach(MIMEText(state["reply_message"], 'plain'))
         filepath = state.get("generated_doc_path")
+        # Only attach HTML if it was generated (i.e. user explicitly asked for report)
         if filepath and os.path.exists(filepath):
             with open(filepath, "rb") as f:
                 part = MIMEApplication(f.read(), Name=os.path.basename(filepath))
@@ -462,30 +465,23 @@ def dispatch_and_update(state: AgentState) -> dict:
         server.send_message(msg)
     except Exception as e: pass
 
-    # 2. Update Database State
     if doc_type != "Analytics Dashboard":
         items_str = ", ".join([f"{i['quantity']}x {i['product']}" for i in state["requested_items"]])
         update_client_status(state["sender_email"], state["display_name"], items_str, new_status)
 
-    # 3. AUTOMATED SUPPLIER REORDER TRIGGER (Internal)
     reorder_items = state.get("reorder_items", [])
     if reorder_items:
-        logging.info("Critical stock detected. Dispatching internal restock alert.")
         alert_msg = MIMEMultipart()
         alert_msg['From'] = EMAIL_USER
-        alert_msg['To'] = "jimit93@gmail.com"  # Sending alert to system owner
-        alert_msg['Subject'] = "URGENT: Automated Inventory Restock Alert"
-        
-        body = "Aerotech AI ERP Alert:\n\nThe following items have dropped to critical levels (5 or below) after the latest closed deal:\n\n"
+        alert_msg['To'] = "jimit93@gmail.com" 
+        alert_msg['Subject'] = "URGENT: Restock Alert"
+        body = "Alert:\n"
         for item in reorder_items:
-            body += f"-> {item}\n"
-        body += "\nPlease contact your suppliers to restock immediately."
-        
+            body += f"{item}\n"
         alert_msg.attach(MIMEText(body, 'plain'))
         try:
-            # Reusing the existing server connection
             server.send_message(alert_msg)
-        except Exception as e: pass
+        except Exception: pass
 
     try:
         server.quit()
@@ -530,7 +526,7 @@ app = workflow.compile()
 # ==========================================
 LAST_CHECKED_ID = None
 LAST_REQUEST_TIME = 0.0
-RATE_LIMIT_SECONDS = 60.0  # 1 request per minute rate limiter
+RATE_LIMIT_SECONDS = 60.0  
 
 def fetch_unread_emails():
     global LAST_CHECKED_ID
@@ -587,16 +583,13 @@ async def agent_worker(queue: asyncio.Queue):
         try:
             mail_data = await queue.get()
             
-            # --- RATE LIMITER: 1 Request Per Minute ---
             current_time = time.time()
             elapsed = current_time - LAST_REQUEST_TIME
             if elapsed < RATE_LIMIT_SECONDS:
                 wait_time = RATE_LIMIT_SECONDS - elapsed
-                logging.info(f"Rate limit active. Pausing worker for {wait_time:.1f} seconds...")
                 await asyncio.sleep(wait_time)
             
             LAST_REQUEST_TIME = time.time()
-            # ------------------------------------------
 
             initial_state = {
                 "email_id": mail_data.get("email_id", ""), 
