@@ -188,12 +188,18 @@ def extract_and_validate_intent(state: AgentState) -> dict:
     
     prompt = PromptTemplate.from_template(
         "You are Aerotech Drones AI.\nSender: {sender_email}\nBody:\n{body}\nCatalog:\n{catalog_summary}\n"
-        "Classify intent. If they approve a quote, use 'quote_approval'. If they receive delivery, use 'delivery_confirmed'. If they say price is high, use 'price_negotiation'."
+        "Classify intent. If they ask for pricing or a quote, use 'new_inquiry'. If they say price is high, use 'price_negotiation'."
     )
     
     result = (prompt | structured_llm).invoke({"sender_email": state["sender_email"], "body": state["email_body"], "catalog_summary": catalog_summary})
+    
+    # FIX: Print the AI's internal decision directly to your Render Logs
+    logging.info(f"AI DECISION -> is_drone: {result.is_drone_inquiry}, intent: {result.intent}, items: {result.items}")
         
-    if not result.is_drone_inquiry or result.intent == "unrelated": return {"intent": "unrelated"}
+    if not result.is_drone_inquiry or result.intent == "unrelated": 
+        logging.warning("Workflow Terminated: Gemini classified this email as unrelated or junk.")
+        return {"intent": "unrelated"}
+        
     if result.intent == "clarification_needed": return {"intent": "clarification_needed", "reply_message": result.clarification_prompt}
     if result.intent == "out_of_stock": return {"intent": "out_of_stock", "reply_message": f"Sorry, {result.unrecognized_item} is out of stock."}
 
@@ -214,18 +220,6 @@ def extract_and_validate_intent(state: AgentState) -> dict:
                 extracted_items.append({"product": prod, "quantity": int(qty)})
 
     return {"current_db_status": current_status, "intent": result.intent, "requested_items": extracted_items, "discount_applied": discount_applied}
-
-def route_workflow(state: AgentState) -> str:
-    i = state["intent"]
-    if i == "owner_analytics": return "generate_analytics"
-    elif i == "owner_query": return "answer_owner_query"
-    elif i == "new_inquiry": return "generate_quote"
-    elif i == "price_negotiation": return "escalate_to_owner"
-    elif i == "quote_approval": return "generate_lpo"
-    elif i == "delivery_confirmed": return "generate_invoice"
-    elif i in ["clarification_needed", "out_of_stock"]: return "dispatch_direct_message"
-    else: return "end"
-
 # ----------------- OWNER INTELLIGENCE -----------------
 def escalate_to_owner(state: AgentState) -> dict:
     logging.info("Escalating negotiation to owner...")
@@ -538,7 +532,8 @@ def fetch_unread_emails():
                         body = ""
                         if msg.is_multipart():
                             for part in msg.walk():
-                                if part.get_content_type() == "text/plain":
+                                # FIX: Accept both plain text AND HTML emails to prevent empty bodies
+                                if part.get_content_type() in ["text/plain", "text/html"]:
                                     body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
                                     break
                         else:
@@ -622,7 +617,7 @@ async def agent_worker(queue: asyncio.Queue):
             queue.task_done()
         await asyncio.sleep(5)
 
-class DummyHandler(BaseHTTPRequestHandler):
+class DummyHandler(BaseHTTPRequestHandler):def fetch_unread_emails():
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
