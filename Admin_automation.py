@@ -493,7 +493,6 @@ workflow.add_edge("dispatch_direct_message", END)
 workflow.add_edge("dispatch", END)
 
 app = workflow.compile()
-
 # ==========================================
 # 5. ASYNC POLLER & FOLLOW-UP ENGINE
 # ==========================================
@@ -532,7 +531,7 @@ def fetch_unread_emails():
                         body = ""
                         if msg.is_multipart():
                             for part in msg.walk():
-                                # FIX: Accept both plain text AND HTML emails to prevent empty bodies
+                                # FIX: Accept both plain text AND HTML emails
                                 if part.get_content_type() in ["text/plain", "text/html"]:
                                     body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
                                     break
@@ -617,7 +616,7 @@ async def agent_worker(queue: asyncio.Queue):
             queue.task_done()
         await asyncio.sleep(5)
 
-class DummyHandler(BaseHTTPRequestHandler):def fetch_unread_emails():
+class DummyHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
