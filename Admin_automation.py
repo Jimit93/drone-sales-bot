@@ -63,7 +63,7 @@ INITIAL_INVENTORY = [
 ]
 
 # ==========================================
-# 2. SQLITE ERP DATABASE
+# 2. SQLITE ERP DATABASE & AUTO-FIX SCHEMA
 # ==========================================
 def initialize_database():
     with sqlite3.connect(DB_FILE) as conn:
@@ -87,6 +87,24 @@ def initialize_database():
                 specs TEXT
             )
         """)
+        
+        # Safety check: Drop and recreate inventory table if old schema columns are missing
+        cursor.execute("PRAGMA table_info(inventory)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if "sales" not in columns or "buying_price" not in columns:
+            logging.info("Old inventory schema detected. Recreating table with correct columns...")
+            cursor.execute("DROP TABLE inventory")
+            cursor.execute("""
+                CREATE TABLE inventory (
+                    product_name TEXT PRIMARY KEY,
+                    buying_price REAL,
+                    selling_price REAL,
+                    stock INTEGER,
+                    sales INTEGER,
+                    specs TEXT
+                )
+            """)
+
         cursor.execute("SELECT COUNT(*) FROM inventory")
         if cursor.fetchone()[0] == 0:
             cursor.executemany(
@@ -545,8 +563,8 @@ def fetch_unread_emails():
                         raw_from = msg.get('from', '')
                         display_name, sender_email = email.utils.parseaddr(raw_from)
                         
-                        # ----- IGNORE AUTOMATED RENDER/JUNK EMAILS -----
-                        if "render" in sender_email.lower() or "no-reply" in sender_email.lower():
+                        # ----- IGNORE AUTOMATED JUNK/RENDER EMAILS -----
+                        if any(domain in sender_email.lower() for domain in ["render", "no-reply", "temu", "support"]):
                             continue
                         # -----------------------------------------------
 
@@ -620,7 +638,7 @@ def start_dummy_server():
 
 async def main():
     email_queue = asyncio.Queue()
-    await asyncio.gather(email_poller(email_queue), agent_worker(email_queue))
+    asyncio.gather(email_poller(email_queue), agent_worker(email_queue))
 
 if __name__ == "__main__":
     threading.Thread(target=start_dummy_server, daemon=True).start()
