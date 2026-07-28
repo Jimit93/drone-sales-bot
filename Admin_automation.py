@@ -42,6 +42,8 @@ SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 DB_FILE = "aerotech.db"
 
+LOW_STOCK_THRESHOLD = 5  # Reorder trigger limit
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 INITIAL_INVENTORY = [
@@ -141,6 +143,7 @@ class AgentState(TypedDict):
     doc_type_sent: Optional[str]
     reply_message: Optional[str]
     error_message: Optional[str]
+    reorder_items: List[str]  # New: Tracks items that hit the low-stock threshold
 
 class RequestedItem(BaseModel):
     product: str = Field(description="Product name or query mentioned by client")
@@ -166,7 +169,7 @@ def extract_and_validate_intent(state: AgentState) -> dict:
     catalog = get_inventory_catalog()
     catalog_summary = "\n".join([f"- {name}: ₹{data['price']}" for name, data in catalog.items()])
     
-    llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+    llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", temperature=0)
     structured_llm = llm.with_structured_output(EmailExtraction)
     
     prompt = PromptTemplate.from_template(
@@ -231,7 +234,7 @@ def route_workflow(state: AgentState) -> str:
     elif i in ["clarification_needed", "out_of_stock"]: return "dispatch_direct_message"
     else: return "end"
 
-# ----------------- MOBILE-FRIENDLY BI DASHBOARD & MATPLOTLIB -----------------
+# ----------------- MOBILE-FRIENDLY BI DASHBOARD -----------------
 def generate_analytics(state: AgentState) -> dict:
     logging.info("Generating Mobile-Friendly BI Dashboard & Visuals...")
     with sqlite3.connect(DB_FILE) as conn:
@@ -257,7 +260,6 @@ def generate_analytics(state: AgentState) -> dict:
         for name, stock, sale, sp, bp in inv_data:
             targeted_text += f"• **{name}**: {stock} in stock | Sold: {sale}\n"
 
-    # High-Resolution Matplotlib Visuals
     plt.figure(figsize=(10, 6), dpi=300)
     x = range(len(products))
     width = 0.35
@@ -278,7 +280,6 @@ def generate_analytics(state: AgentState) -> dict:
     plt.savefig(chart_path)
     plt.close()
 
-    # Mobile-Responsive HTML Dashboard
     html_path = f"./docs/Aerotech_Dashboard_{datetime.now().strftime('%y%m%d_%H%M%S')}.html"
     html_content = f"""<!DOCTYPE html>
     <html lang="en">
@@ -324,7 +325,6 @@ def generate_analytics(state: AgentState) -> dict:
         f.write(html_content)
 
     reply_text = f"Dear Jimit,\n\nHere is your executive analytics report:\n\n{targeted_text}\n\nA mobile-responsive HTML dashboard and a high-resolution visual chart have been attached.\n\nBest Regards,\nAerotech AI ERP"
-
     return {"generated_doc_path": chart_path, "doc_type_sent": "Analytics Dashboard", "reply_message": reply_text}
 
 # ----------------- STANDARD DOCUMENT GENERATORS -----------------
@@ -374,20 +374,37 @@ def ask_about_invoice(state: AgentState) -> dict:
     return {"doc_type_sent": "Invoice Inquiry", "reply_message": "Sir, have you received the delivery?"}
 
 def generate_invoice(state: AgentState) -> dict:
-    logging.info("Generating Tax Invoice & Deducting Inventory...")
+    logging.info("Generating Tax Invoice & Checking Stock Thresholds...")
     requested_items = state.get("requested_items", [])
+    reorder_list = []
+    
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         for item in requested_items:
             prod = item.get("product")
             qty = item.get("quantity", 1)
+            
+            # 1. Deduct Inventory
             cursor.execute("""
                 UPDATE inventory 
                 SET stock = MAX(stock - ?, 0), sales = sales + ? 
                 WHERE product_name = ?
             """, (qty, qty, prod))
+            
+            # 2. Check if reorder is needed
+            cursor.execute("SELECT stock FROM inventory WHERE product_name = ?", (prod,))
+            new_stock = cursor.fetchone()[0]
+            if new_stock <= LOW_STOCK_THRESHOLD:
+                reorder_list.append(f"{prod} (Current Stock: {new_stock})")
+                
         conn.commit()
-    return {"generated_doc_path": generate_professional_pdf("Invoice", state), "doc_type_sent": "Tax Invoice", "reply_message": "Here is your final tax invoice sir."}
+        
+    return {
+        "generated_doc_path": generate_professional_pdf("Invoice", state), 
+        "doc_type_sent": "Tax Invoice", 
+        "reply_message": "Here is your final tax invoice sir.",
+        "reorder_items": reorder_list
+    }
 
 # ----------------- DISPATCHERS -----------------
 def dispatch_direct_message(state: AgentState) -> dict:
@@ -411,6 +428,7 @@ def dispatch_and_update(state: AgentState) -> dict:
     msg['From'] = EMAIL_USER
     msg['To'] = state["sender_email"]
     
+    # 1. Prepare and Send Client Email
     if doc_type == "Invoice Inquiry":
         msg['Subject'] = "Delivery Status"
         msg.attach(MIMEText(state["reply_message"], 'plain'))
@@ -442,12 +460,36 @@ def dispatch_and_update(state: AgentState) -> dict:
         server.starttls()
         server.login(EMAIL_USER, EMAIL_PASS)
         server.send_message(msg)
-        server.quit()
     except Exception as e: pass
 
+    # 2. Update Database State
     if doc_type != "Analytics Dashboard":
         items_str = ", ".join([f"{i['quantity']}x {i['product']}" for i in state["requested_items"]])
         update_client_status(state["sender_email"], state["display_name"], items_str, new_status)
+
+    # 3. AUTOMATED SUPPLIER REORDER TRIGGER (Internal)
+    reorder_items = state.get("reorder_items", [])
+    if reorder_items:
+        logging.info("Critical stock detected. Dispatching internal restock alert.")
+        alert_msg = MIMEMultipart()
+        alert_msg['From'] = EMAIL_USER
+        alert_msg['To'] = "jimit93@gmail.com"  # Sending alert to system owner
+        alert_msg['Subject'] = "URGENT: Automated Inventory Restock Alert"
+        
+        body = "Aerotech AI ERP Alert:\n\nThe following items have dropped to critical levels (5 or below) after the latest closed deal:\n\n"
+        for item in reorder_items:
+            body += f"-> {item}\n"
+        body += "\nPlease contact your suppliers to restock immediately."
+        
+        alert_msg.attach(MIMEText(body, 'plain'))
+        try:
+            # Reusing the existing server connection
+            server.send_message(alert_msg)
+        except Exception as e: pass
+
+    try:
+        server.quit()
+    except Exception: pass
         
     return {}
 
@@ -484,9 +526,11 @@ workflow.add_edge("dispatch", END)
 app = workflow.compile()
 
 # ==========================================
-# 5. ASYNC POLLER
+# 5. ASYNC POLLER & RATE LIMITER
 # ==========================================
 LAST_CHECKED_ID = None
+LAST_REQUEST_TIME = 0.0
+RATE_LIMIT_SECONDS = 60.0  # 1 request per minute rate limiter
 
 def fetch_unread_emails():
     global LAST_CHECKED_ID
@@ -538,9 +582,22 @@ async def email_poller(queue: asyncio.Queue):
         await asyncio.sleep(10)
 
 async def agent_worker(queue: asyncio.Queue):
+    global LAST_REQUEST_TIME
     while True:
         try:
             mail_data = await queue.get()
+            
+            # --- RATE LIMITER: 1 Request Per Minute ---
+            current_time = time.time()
+            elapsed = current_time - LAST_REQUEST_TIME
+            if elapsed < RATE_LIMIT_SECONDS:
+                wait_time = RATE_LIMIT_SECONDS - elapsed
+                logging.info(f"Rate limit active. Pausing worker for {wait_time:.1f} seconds...")
+                await asyncio.sleep(wait_time)
+            
+            LAST_REQUEST_TIME = time.time()
+            # ------------------------------------------
+
             initial_state = {
                 "email_id": mail_data.get("email_id", ""), 
                 "sender_email": mail_data.get("sender_email", ""),
@@ -549,7 +606,7 @@ async def agent_worker(queue: asyncio.Queue):
                 "email_body": mail_data.get("email_body", ""), 
                 "current_db_status": None, "intent": "unrelated", "company_name": mail_data.get("display_name", ""), 
                 "requested_items": [], "unrecognized_item_name": None, "generated_doc_path": None,
-                "doc_type_sent": None, "reply_message": None, "error_message": None
+                "doc_type_sent": None, "reply_message": None, "error_message": None, "reorder_items": []
             }
             await asyncio.to_thread(app.invoke, initial_state)
             queue.task_done()
