@@ -324,28 +324,73 @@ def generate_invoice(state: AgentState) -> dict:
         conn.commit()
     return {"generated_doc_path": generate_professional_pdf("Tax Invoice", state), "doc_type_sent": "Tax Invoice"}
 
+# ----------------- DISPATCHERS -----------------
 def dispatch_direct_message(state: AgentState) -> dict:
     msg = MIMEMultipart()
     msg['From'] = EMAIL_USER
     msg['To'] = state["sender_email"]
-    msg['Subject'] = f"Re: {state['email_subject']}"
-    msg.attach(MIMEText(state.get("reply_message", ""), 'plain'))
+    
+    # Safe subject handling
+    safe_subject = state.get('email_subject') or "Aerotech Inquiry"
+    msg['Subject'] = f"Re: {safe_subject}"
+    
+    # THE FIX: Force it to evaluate as a string, never None
+    reply_text = state.get("reply_message") or "We have received your message and will update you shortly."
+    msg.attach(MIMEText(reply_text, 'plain'))
+    
     try:
         server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
         server.starttls()
         server.login(EMAIL_USER, EMAIL_PASS)
         server.send_message(msg)
         server.quit()
-    except Exception: pass
+    except Exception as e:
+        logging.error(f"Direct Message SMTP Error: {e}")
     return {}
 
 def dispatch_and_update(state: AgentState) -> dict:
-    doc_type = state["doc_type_sent"]
+    doc_type = state.get("doc_type_sent") or "Document"
+    
     if doc_type == "Negotiation Phase":
         dispatch_direct_message(state)
-        update_client_status(state["sender_email"], state["display_name"], "", "NEGOTIATING")
+        update_client_status(state["sender_email"], state.get("display_name") or "Client", "", "NEGOTIATING")
         return {}
 
+    msg = MIMEMultipart()
+    msg['From'] = EMAIL_USER
+    msg['To'] = state["sender_email"]
+    msg['Subject'] = f"Your {doc_type} from Aerotech Drones"
+    
+    # THE FIX: Force it to evaluate as a string, never None
+    reply_text = state.get("reply_message") or f"Please find your {doc_type} attached."
+    msg.attach(MIMEText(reply_text, 'plain'))
+    
+    filepath = state.get("generated_doc_path")
+    if filepath and os.path.exists(filepath):
+        with open(filepath, "rb") as f:
+            part = MIMEApplication(f.read(), Name=os.path.basename(filepath))
+        part['Content-Disposition'] = f'attachment; filename="{os.path.basename(filepath)}"'
+        msg.attach(part)
+        
+    try:
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(EMAIL_USER, EMAIL_PASS)
+        server.send_message(msg)
+        server.quit()
+        logging.info(f"Successfully dispatched {doc_type} to {state['sender_email']}")
+    except Exception as e:
+        logging.error(f"CRITICAL SMTP SEND ERROR: {e}")
+
+    # Database state updates
+    status_map = {"Quotation": "QUOTE_SENT", "Local Purchase Order": "LPO_SENT", "Tax Invoice": "INVOICE_SENT"}
+    new_status = status_map.get(doc_type, "UNKNOWN")
+    
+    requested_items = state.get("requested_items") or []
+    items_str = ", ".join([f"{i.get('quantity', 1)}x {i.get('product', 'Item')}" for i in requested_items])
+    
+    update_client_status(state["sender_email"], state.get("display_name") or "Client", items_str, new_status)
+    return {}
     msg = MIMEMultipart()
     msg['From'] = EMAIL_USER
     msg['To'] = state["sender_email"]
