@@ -520,7 +520,7 @@ app = workflow.compile()
 # ==========================================
 LAST_CHECKED_ID = None
 LAST_REQUEST_TIME = 0.0
-RATE_LIMIT_SECONDS = 5.0  
+RATE_LIMIT_SECONDS = 60.0 
 PROCESSED_UIDS = set()
 
 def fetch_unread_emails():
