@@ -63,13 +63,17 @@ INITIAL_INVENTORY = [
 ]
 
 # ==========================================
-# 2. SQLITE ERP DATABASE & AUTO-FIX SCHEMA
+# 2. SQLITE ERP DATABASE (CLEAN REBUILD)
 # ==========================================
 def initialize_database():
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
+        # Drop old tables to prevent schema mismatch errors on Render storage
+        cursor.execute("DROP TABLE IF EXISTS inventory")
+        cursor.execute("DROP TABLE IF EXISTS orders")
+        
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS orders (
+            CREATE TABLE orders (
                 email TEXT PRIMARY KEY,
                 client_name TEXT,
                 items TEXT,
@@ -78,7 +82,7 @@ def initialize_database():
             )
         """)
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS inventory (
+            CREATE TABLE inventory (
                 product_name TEXT PRIMARY KEY,
                 buying_price REAL,
                 selling_price REAL,
@@ -87,32 +91,12 @@ def initialize_database():
                 specs TEXT
             )
         """)
-        
-        # Safety check: Drop and recreate inventory table if old schema columns are missing
-        cursor.execute("PRAGMA table_info(inventory)")
-        columns = [col[1] for col in cursor.fetchall()]
-        if "sales" not in columns or "buying_price" not in columns:
-            logging.info("Old inventory schema detected. Recreating table with correct columns...")
-            cursor.execute("DROP TABLE inventory")
-            cursor.execute("""
-                CREATE TABLE inventory (
-                    product_name TEXT PRIMARY KEY,
-                    buying_price REAL,
-                    selling_price REAL,
-                    stock INTEGER,
-                    sales INTEGER,
-                    specs TEXT
-                )
-            """)
-
-        cursor.execute("SELECT COUNT(*) FROM inventory")
-        if cursor.fetchone()[0] == 0:
-            cursor.executemany(
-                "INSERT INTO inventory (product_name, buying_price, selling_price, stock, sales, specs) VALUES (?, ?, ?, ?, ?, ?)",
-                INITIAL_INVENTORY
-            )
-            logging.info("Seeded live SQLite inventory database.")
+        cursor.executemany(
+            "INSERT INTO inventory (product_name, buying_price, selling_price, stock, sales, specs) VALUES (?, ?, ?, ?, ?, ?)",
+            INITIAL_INVENTORY
+        )
         conn.commit()
+        logging.info("Fresh SQLite database initialized and seeded successfully.")
 
 def get_inventory_catalog():
     with sqlite3.connect(DB_FILE) as conn:
@@ -638,7 +622,7 @@ def start_dummy_server():
 
 async def main():
     email_queue = asyncio.Queue()
-    asyncio.gather(email_poller(email_queue), agent_worker(email_queue))
+    await asyncio.gather(email_poller(email_queue), agent_worker(email_queue))
 
 if __name__ == "__main__":
     threading.Thread(target=start_dummy_server, daemon=True).start()
