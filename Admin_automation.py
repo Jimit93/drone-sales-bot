@@ -264,6 +264,83 @@ def answer_owner_query(state: AgentState) -> dict:
     response = llm.invoke(f"Context:\n{context}\n\nOwner Query: {state['owner_command']}\n\nAnswer directly based on context.")
     return {"reply_message": response.content.strip()}
 
+def generate_analytics(state: AgentState) -> dict:
+    logging.info("Executing Owner Dashboard Generation...")
+    with sqlite3.connect(DB_FILE) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT product_name, stock, sales, selling_price, buying_price FROM inventory")
+        inv_data = cursor.fetchall()
+
+    products = [row[0] for row in inv_data]
+    stocks = [row[1] for row in inv_data]
+    sales = [row[2] for row in inv_data]
+
+    total_rev = sum(s * sp for (_, _, s, sp, _) in inv_data)
+    total_prof = sum(s * (sp - bp) for (_, _, s, sp, bp) in inv_data)
+    
+    plt.figure(figsize=(9, 5), dpi=200)
+    x = range(len(products))
+    width = 0.35
+    plt.bar([p - width/2 for p in x], sales, width=width, label='Total Sold', color='#2ecc71')
+    plt.bar([p + width/2 for p in x], stocks, width=width, label='Current Stock', color='#3498db')
+    plt.xlabel('Drone Models', fontsize=12, fontweight='bold', color='#333')
+    plt.ylabel('Units', fontsize=12, fontweight='bold', color='#333')
+    plt.title('Aerotech Drones - Live Inventory', fontsize=14, fontweight='bold', pad=15, color='#2c3e50')
+    plt.xticks(x, [p.replace("DJI ", "") for p in products], rotation=45, ha='right', fontsize=9)
+    plt.legend(frameon=True, facecolor='#f9f9f9')
+    plt.grid(axis='y', linestyle='--', alpha=0.5)
+    plt.tight_layout()
+
+    buf = BytesIO()
+    plt.savefig(buf, format='png')
+    plt.close()
+    img_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+
+    os.makedirs("./docs", exist_ok=True)
+    html_path = f"./docs/Aerotech_Dashboard_{datetime.now().strftime('%y%m%d_%H%M%S')}.html"
+    
+    html_content = f"""<!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+        <title>Aerotech Executive Dashboard</title>
+        <style>
+            * {{ box-sizing: border-box; }}
+            body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #f4f7f6; margin: 0; padding: 10px; color: #333; }}
+            .container {{ width: 100%; max-width: 900px; margin: auto; background: white; padding: 15px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }}
+            h1 {{ color: #2c3e50; font-size: 20px; border-bottom: 2px solid #3498db; padding-bottom: 8px; margin-top: 0; text-align: center; }}
+            .metrics-grid {{ display: flex; flex-direction: column; gap: 10px; margin-bottom: 20px; }}
+            @media (min-width: 600px) {{ .metrics-grid {{ flex-direction: row; gap: 15px; }} }}
+            .metric-box {{ flex: 1; background: #3498db; color: white; padding: 15px; border-radius: 8px; text-align: center; }}
+            .metric-box.profit {{ background: #2ecc71; }}
+            .metric-box h2 {{ margin: 0; font-size: 22px; }}
+            .metric-box p {{ margin: 5px 0 0 0; text-transform: uppercase; font-size: 11px; font-weight: bold; letter-spacing: 0.5px; }}
+            .chart-container {{ width: 100%; text-align: center; margin-top: 15px; overflow: hidden; }}
+            .chart-container h3 {{ font-size: 16px; margin-bottom: 10px; }}
+            .chart-container img {{ width: 100%; height: auto; border-radius: 8px; border: 1px solid #ddd; display: block; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>Aerotech Executive Dashboard</h1>
+            <div class="metrics-grid">
+                <div class="metric-box"><h2>₹{total_rev:,.2f}</h2><p>Gross Revenue</p></div>
+                <div class="metric-box profit"><h2>₹{total_prof:,.2f}</h2><p>Net Profit</p></div>
+            </div>
+            <div class="chart-container">
+                <h3>Visual Analytics Breakdown</h3>
+                <img src="data:image/png;base64,{img_b64}" alt="Aerotech Analytics Chart">
+            </div>
+        </div>
+    </body>
+    </html>"""
+    
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    return {"generated_doc_path": html_path, "doc_type_sent": "Analytics Dashboard", "reply_message": "HTML report attached and optimized for mobile viewing."}
+
 # ----------------- DOCUMENT GENERATORS -----------------
 def generate_professional_pdf(doc_type: str, state: AgentState) -> str:
     client_name = state.get("company_name", state.get("display_name", "Valued Client"))
@@ -330,11 +407,9 @@ def dispatch_direct_message(state: AgentState) -> dict:
     msg['From'] = EMAIL_USER
     msg['To'] = state["sender_email"]
     
-    # Safe subject handling
     safe_subject = state.get('email_subject') or "Aerotech Inquiry"
     msg['Subject'] = f"Re: {safe_subject}"
     
-    # THE FIX: Force it to evaluate as a string, never None
     reply_text = state.get("reply_message") or "We have received your message and will update you shortly."
     msg.attach(MIMEText(reply_text, 'plain'))
     
@@ -361,7 +436,6 @@ def dispatch_and_update(state: AgentState) -> dict:
     msg['To'] = state["sender_email"]
     msg['Subject'] = f"Your {doc_type} from Aerotech Drones"
     
-    # THE FIX: Force it to evaluate as a string, never None
     reply_text = state.get("reply_message") or f"Please find your {doc_type} attached."
     msg.attach(MIMEText(reply_text, 'plain'))
     
@@ -382,7 +456,6 @@ def dispatch_and_update(state: AgentState) -> dict:
     except Exception as e:
         logging.error(f"CRITICAL SMTP SEND ERROR: {e}")
 
-    # Database state updates
     status_map = {"Quotation": "QUOTE_SENT", "Local Purchase Order": "LPO_SENT", "Tax Invoice": "INVOICE_SENT"}
     new_status = status_map.get(doc_type, "UNKNOWN")
     
@@ -391,39 +464,13 @@ def dispatch_and_update(state: AgentState) -> dict:
     
     update_client_status(state["sender_email"], state.get("display_name") or "Client", items_str, new_status)
     return {}
-    msg = MIMEMultipart()
-    msg['From'] = EMAIL_USER
-    msg['To'] = state["sender_email"]
-    msg['Subject'] = f"Your {doc_type} from Aerotech Drones"
-    msg.attach(MIMEText(f"Please find your {doc_type} attached.", 'plain'))
-    
-    filepath = state.get("generated_doc_path")
-    if filepath and os.path.exists(filepath):
-        with open(filepath, "rb") as f: part = MIMEApplication(f.read(), Name=os.path.basename(filepath))
-        part['Content-Disposition'] = f'attachment; filename="{os.path.basename(filepath)}"'
-        msg.attach(part)
-        
-    try:
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
-        server.starttls()
-        server.login(EMAIL_USER, EMAIL_PASS)
-        server.send_message(msg)
-        server.quit()
-    except Exception: pass
 
-    status_map = {"Quotation": "QUOTE_SENT", "Local Purchase Order": "LPO_SENT", "Tax Invoice": "INVOICE_SENT"}
-    new_status = status_map.get(doc_type, "UNKNOWN")
-    items_str = ", ".join([f"{i['quantity']}x {i['product']}" for i in state.get("requested_items", [])])
-    update_client_status(state["sender_email"], state["display_name"], items_str, new_status)
-    return {}
-
-def generate_analytics(state: AgentState) -> dict: pass # Skipped for brevity, same as previous logic but routes to dispatch
-
-# GRAPH COMPILATION 
+# ----------------- GRAPH COMPILATION -----------------
 workflow = StateGraph(AgentState)
 workflow.add_node("extract", extract_and_validate_intent)
 workflow.add_node("answer_owner_query", answer_owner_query)
 workflow.add_node("escalate_to_owner", escalate_to_owner)
+workflow.add_node("generate_analytics", generate_analytics)
 workflow.add_node("generate_quote", generate_quote)
 workflow.add_node("generate_lpo", generate_lpo)
 workflow.add_node("generate_invoice", generate_invoice)
@@ -432,6 +479,7 @@ workflow.add_node("dispatch", dispatch_and_update)
 
 workflow.set_entry_point("extract")
 workflow.add_conditional_edges("extract", route_workflow, {
+    "generate_analytics": "generate_analytics",
     "answer_owner_query": "answer_owner_query",
     "escalate_to_owner": "escalate_to_owner",
     "generate_quote": "generate_quote",
@@ -441,6 +489,7 @@ workflow.add_conditional_edges("extract", route_workflow, {
     "end": END
 })
 
+workflow.add_edge("generate_analytics", "dispatch")
 workflow.add_edge("answer_owner_query", "dispatch_direct_message")
 workflow.add_edge("escalate_to_owner", END)
 workflow.add_edge("generate_quote", "dispatch")
@@ -454,17 +503,57 @@ app = workflow.compile()
 # ==========================================
 # 5. ASYNC POLLER & FOLLOW-UP ENGINE
 # ==========================================
-LAST_CHECKED_ID = None
-LAST_REQUEST_TIME = 0.0
 RATE_LIMIT_SECONDS = 15.0  
 PROCESSED_UIDS = set()
 
 def fetch_unread_emails():
-    # ... existing imaplib code ...
-    pass # Keep your exact existing fetch_unread_emails function here
+    global PROCESSED_UIDS
+    emails_data = []
+    try:
+        mail = imaplib.IMAP4_SSL(IMAP_SERVER)
+        mail.login(EMAIL_USER, EMAIL_PASS)
+        mail.select('INBOX') 
+        status, messages = mail.uid('search', None, 'UNSEEN')
+        
+        if status == 'OK' and messages[0]:
+            uids = messages[0].split()
+            
+            for uid in uids[-5:]:
+                if uid in PROCESSED_UIDS:
+                    continue
+                PROCESSED_UIDS.add(uid)
+                
+                res, msg_data = mail.uid('fetch', uid, '(RFC822)')
+                mail.uid('store', uid, '+FLAGS', '(\\Seen)')
+                
+                for response_part in msg_data:
+                    if isinstance(response_part, tuple):
+                        msg = email.message_from_bytes(response_part[1])
+                        raw_from = msg.get('from', '')
+                        display_name, sender_email = email.utils.parseaddr(raw_from)
+                        
+                        if any(domain in sender_email.lower() for domain in ["render", "no-reply", "temu", "support"]):
+                            continue
+
+                        body = ""
+                        if msg.is_multipart():
+                            for part in msg.walk():
+                                if part.get_content_type() == "text/plain":
+                                    body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                                    break
+                        else:
+                            body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+
+                        emails_data.append({
+                            "email_id": uid.decode(), "sender_email": sender_email,
+                            "display_name": display_name, "email_subject": msg.get('subject', ''), "email_body": body
+                        })
+        mail.logout()
+    except Exception as e:
+        logging.error(f"IMAP Fetch Error: {e}")
+    return emails_data
 
 async def follow_up_manager():
-    """Background task checking for 3-day stale quotes"""
     while True:
         try:
             with sqlite3.connect(DB_FILE) as conn:
@@ -476,12 +565,11 @@ async def follow_up_manager():
                     if datetime.now() - last_date > timedelta(days=3):
                         logging.info(f"Sending 3-day follow-up to {email_addr}")
                         
-                        # Send Follow-up Email
                         msg = MIMEMultipart()
                         msg['From'] = EMAIL_USER
                         msg['To'] = email_addr
                         msg['Subject'] = "Following up on your Aerotech Quote"
-                        msg.attach(MIMEText(f"Sir, are you interested in proceeding with the quotation we sent?\n\nRegards,\nAerotech Drones", 'plain'))
+                        msg.attach(MIMEText("Sir, are you interested in proceeding with the quotation we sent?\n\nRegards,\nAerotech Drones", 'plain'))
                         
                         server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
                         server.starttls()
@@ -489,13 +577,12 @@ async def follow_up_manager():
                         server.send_message(msg)
                         server.quit()
                         
-                        # Update DB to prevent spamming
                         cursor.execute("UPDATE orders SET status = 'FOLLOWED_UP', last_updated = ? WHERE email = ?", 
                                        (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), email_addr))
                         conn.commit()
         except Exception as e:
             logging.error(f"Follow Up Error: {e}")
-        await asyncio.sleep(3600) # Check once every hour
+        await asyncio.sleep(3600)
 
 async def email_poller(queue: asyncio.Queue):
     while True:
@@ -506,6 +593,7 @@ async def email_poller(queue: asyncio.Queue):
 
 async def agent_worker(queue: asyncio.Queue):
     global LAST_REQUEST_TIME
+    LAST_REQUEST_TIME = 0.0
     while True:
         try:
             mail_data = await queue.get()
@@ -514,9 +602,24 @@ async def agent_worker(queue: asyncio.Queue):
             if elapsed < RATE_LIMIT_SECONDS:
                 await asyncio.sleep(RATE_LIMIT_SECONDS - elapsed)
             LAST_REQUEST_TIME = time.time()
-            # ... app.invoke(initial_state) ...
+
+            initial_state = {
+                "email_id": mail_data.get("email_id", ""), 
+                "sender_email": mail_data.get("sender_email", ""),
+                "display_name": mail_data.get("display_name", ""), 
+                "email_subject": mail_data.get("email_subject", ""),
+                "email_body": mail_data.get("email_body", ""), 
+                "current_db_status": None, "intent": "unrelated", 
+                "owner_command": None,
+                "company_name": mail_data.get("display_name", ""), 
+                "requested_items": [], "unrecognized_item_name": None, "generated_doc_path": None,
+                "doc_type_sent": None, "reply_message": None, "discount_applied": 0.0
+            }
+            await asyncio.to_thread(app.invoke, initial_state)
             queue.task_done()
-        except Exception: pass
+        except Exception as e:
+            logging.error(f"Agent Worker Error: {e}")
+            queue.task_done()
         await asyncio.sleep(5)
 
 class DummyHandler(BaseHTTPRequestHandler):
@@ -534,7 +637,7 @@ async def main():
     await asyncio.gather(
         email_poller(email_queue), 
         agent_worker(email_queue), 
-        follow_up_manager() # New background task
+        follow_up_manager()
     )
 
 if __name__ == "__main__":
