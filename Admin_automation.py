@@ -259,7 +259,6 @@ def generate_analytics(state: AgentState) -> dict:
     total_rev = sum(s * sp for (_, _, s, sp, _) in inv_data)
     total_prof = sum(s * (sp - bp) for (_, _, s, sp, bp) in inv_data)
     
-    # Generate Matplotlib chart
     plt.figure(figsize=(9, 5), dpi=200)
     x = range(len(products))
     width = 0.35
@@ -278,7 +277,6 @@ def generate_analytics(state: AgentState) -> dict:
     plt.close()
     img_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
 
-    # Mobile-Friendly HTML generation
     os.makedirs("./docs", exist_ok=True)
     html_path = f"./docs/Aerotech_Dashboard_{datetime.now().strftime('%y%m%d_%H%M%S')}.html"
     
@@ -414,7 +412,8 @@ def dispatch_direct_message(state: AgentState) -> dict:
         server.login(EMAIL_USER, EMAIL_PASS)
         server.send_message(msg)
         server.quit()
-    except Exception as e: pass
+    except Exception as e:
+        logging.error(f"Direct Message SMTP Error: {e}")
     return {}
 
 def dispatch_and_update(state: AgentState) -> dict:
@@ -454,7 +453,9 @@ def dispatch_and_update(state: AgentState) -> dict:
         server.starttls()
         server.login(EMAIL_USER, EMAIL_PASS)
         server.send_message(msg)
-    except Exception as e: pass
+        logging.info(f"Successfully dispatched email to {state['sender_email']}")
+    except Exception as e:
+        logging.error(f"CRITICAL SMTP SEND ERROR: {e}")
 
     if doc_type != "Analytics Dashboard":
         items_str = ", ".join([f"{i['quantity']}x {i['product']}" for i in state["requested_items"]])
@@ -543,6 +544,12 @@ def fetch_unread_emails():
                         msg = email.message_from_bytes(response_part[1])
                         raw_from = msg.get('from', '')
                         display_name, sender_email = email.utils.parseaddr(raw_from)
+                        
+                        # ----- IGNORE AUTOMATED RENDER/JUNK EMAILS -----
+                        if "render" in sender_email.lower() or "no-reply" in sender_email.lower():
+                            continue
+                        # -----------------------------------------------
+
                         body = ""
                         if msg.is_multipart():
                             for part in msg.walk():
@@ -559,7 +566,8 @@ def fetch_unread_emails():
         else:
             if LAST_CHECKED_ID is None: LAST_CHECKED_ID = 0
         mail.logout()
-    except Exception as e: pass
+    except Exception as e:
+        logging.error(f"IMAP Fetch Error: {e}")
     return emails_data
 
 async def email_poller(queue: asyncio.Queue):
@@ -595,6 +603,7 @@ async def agent_worker(queue: asyncio.Queue):
             await asyncio.to_thread(app.invoke, initial_state)
             queue.task_done()
         except Exception as e:
+            logging.error(f"Agent Worker Error: {e}")
             queue.task_done()
         await asyncio.sleep(3)
 
