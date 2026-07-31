@@ -1,4 +1,4 @@
-# Aerotech Drones - Autonomous Email ERP Agent
+# Document Controller - Autonomous Email ERP Agent
 
 **Version 5.2 (Live Monitor & WAL Enabled)**
 
